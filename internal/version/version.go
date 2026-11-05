@@ -50,15 +50,23 @@ type Version struct {
 	vs   *VersionSet // for obsolete enqueuing on last unref
 }
 
-// Ref pins the version.
+// Ref pins the version. Panics on a dead version: reviving a released
+// Version may observe deleted files (M-011 item 4).
 func (v *Version) Ref() {
+	if v.refs.Load() == 0 {
+		panic("version: Ref on a released version")
+	}
 	v.refs.Add(1)
 }
 
 // Unref releases the version; when the last reference drops, the files it
 // holds are dereferenced and files reaching zero are enqueued as obsolete.
+// A double Unref is a programming error and panics (M-011 item 4).
 func (v *Version) Unref() {
-	if v.refs.Add(-1) != 0 {
+	if v.refs.Add(-1) < 0 {
+		panic("version: Unref below zero")
+	}
+	if v.refs.Load() != 0 {
 		return
 	}
 	if v.vs != nil {
@@ -94,34 +102,67 @@ func NewVersionSet() *VersionSet {
 	return vs
 }
 
-// Current returns the current version (already referenced by the set).
-func (vs *VersionSet) Current() *Version {
+// Acquire returns the current version with a reference held under vs.mu
+// (M-011 item 3). Every reader (including readState) must hold its own
+// acquired reference; a bare Current() would let Apply obsolete files in
+// use. Release with Unref.
+func (vs *VersionSet) Acquire() *Version {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	v := vs.current
+	v.Ref()
+	return v
+}
+
+// currentLocked returns the current version without a reference.
+// Test-only introspection; readers must use Acquire.
+func (vs *VersionSet) currentLocked() *Version {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	return vs.current
 }
 
-// Apply validates and applies an edit, returning the new Version (refcount 1,
-// held by the set). On error nothing changes.
+// Apply validates and applies an edit, returning the new Version. The set
+// holds the new version's reference; readers take their own via Acquire.
+// On error nothing changes.
 func (vs *VersionSet) Apply(e *manifest.Edit) (*Version, error) {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
 	old := vs.current
 
-	// Convert adds to instances, reusing live ones.
+	// Validate dels against the current version first (M-011 item 5):
+	// deleting an unknown file, or with a mismatched level, is corruption.
+	delSet := map[uint64]manifest.DelFile{}
+	for _, d := range e.DelFiles {
+		found := false
+		for _, level := range old.Levels {
+			for _, fm := range level {
+				if fm.Num == d.Num {
+					if fm.Level != d.Level {
+						return nil, fmt.Errorf("version: del level mismatch for %d: edit %d != %d: %w",
+							d.Num, d.Level, fm.Level, base.ErrCorruption)
+					}
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("version: del of unknown file %d: %w", d.Num, base.ErrCorruption)
+		}
+		delSet[d.Num] = d
+	}
+
+	// Convert adds to instances, reusing live ones. Re-adding a num that is
+	// still live would list it twice (M-011 item 5).
 	adds := make(map[uint64]*FileMeta, len(e.AddFiles))
 	for i := range e.AddFiles {
 		fm := &e.AddFiles[i]
-		if inst, ok := vs.live[fm.Num]; ok {
-			// Re-adding a live file must describe the same file.
-			if inst.Level != fm.Level || inst.Size != fm.Size {
-				return nil, fmt.Errorf("version: re-add mismatch for %d: %w", fm.Num, base.ErrCorruption)
-			}
-			adds[fm.Num] = inst
-		} else {
-			adds[fm.Num] = &FileMeta{FileMeta: *fm}
+		if _, ok := vs.live[fm.Num]; ok {
+			return nil, fmt.Errorf("version: add of live file %d: %w", fm.Num, base.ErrCorruption)
 		}
+		adds[fm.Num] = &FileMeta{FileMeta: *fm}
 	}
 
 	// Build new levels.
@@ -171,10 +212,19 @@ func (vs *VersionSet) Apply(e *manifest.Edit) (*Version, error) {
 		newVersion.Ckpts.ByNum[cf.FileNum] = &cf
 	}
 
-	// Bookkeeping.
-	vs.NextFileNum = e.NextFileNum
-	vs.LastTs = e.LastTs
-	vs.LogNum = e.LogNum
+	// Bookkeeping: monotone max of each counter (M-011 item 2). An edit built
+	// earlier must never roll back the allocator, the timestamp, or the WAL
+	// pointer — reusing file numbers would overwrite live files and repeated
+	// timestamps would break I2.
+	if e.NextFileNum > vs.NextFileNum {
+		vs.NextFileNum = e.NextFileNum
+	}
+	if e.LastTs > vs.LastTs {
+		vs.LastTs = e.LastTs
+	}
+	if e.LogNum > vs.LogNum {
+		vs.LogNum = e.LogNum
+	}
 
 	// Reference accounting (M-010 era fix): file.refs counts live VERSION
 	// memberships. The new version takes membership on its files; the old

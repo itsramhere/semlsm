@@ -170,8 +170,9 @@ func TestManifestCorruptFrame(t *testing.T) {
 		t.Fatalf("err=%v, want ErrCorruption", err)
 	}
 
-	// a flipped byte inside a non-final frame's payload is a torn tail and
-	// is ignored: earlier edits survive
+	// a flipped byte inside the FINAL frame's payload is a torn tail and
+	// is ignored (earlier edits survive): each frame is fsynced, so only
+	// the last can be torn
 	w2, _ := NewWriter(fs, "MANIFEST-000002")
 	if err := w2.Append(sampleEdit(true)); err != nil {
 		t.Fatal(err)

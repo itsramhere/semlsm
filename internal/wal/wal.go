@@ -164,3 +164,90 @@ func Frame(payload []byte) ([]byte, error) {
 	copy(frame[frameHeaderLen:], payload)
 	return frame, nil
 }
+
+// ReplayStrict replays frames with the manifest recovery rules (M-011 item 1).
+// Each manifest edit is fsynced on its own, so only the final frame can
+// legitimately be torn:
+//   - a bad CRC is a torn tail only if that frame ends exactly at EOF;
+//     a bad CRC with bytes after the frame is ErrCorruption;
+//   - a declared length past EOF or a short header at the tail is torn;
+//   - a zero-length frame is torn only if all remaining bytes are zero,
+//     otherwise ErrCorruption;
+//   - a clean end of file (n == 0) is done.
+//
+// validBytes is the offset after the last complete valid frame.
+func ReplayStrict(fs vfs.FS, path string, fn func(payload []byte) error) (validBytes int64, err error) {
+	f, err := fs.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("wal: replay strict %s: %w", path, err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("wal: replay strict %s: %w", path, err)
+	}
+	fileSize := st.Size
+
+	var header [frameHeaderLen]byte
+	payload := make([]byte, 0, 4096)
+	for {
+		n, err := f.ReadAt(header[:], validBytes)
+		if err != nil && err != io.EOF {
+			return validBytes, fmt.Errorf("wal: replay strict %s: read header: %w", path, err)
+		}
+		if n == 0 {
+			return validBytes, nil // clean end
+		}
+		if n < frameHeaderLen {
+			return validBytes, nil // short header at the tail: torn
+		}
+		payloadLen := binary.LittleEndian.Uint32(header[0:4])
+		wantCRC := binary.LittleEndian.Uint32(header[4:8])
+
+		remaining := fileSize - validBytes - frameHeaderLen
+		if payloadLen == 0 {
+			// Torn only if everything after the header is zero.
+			rest := make([]byte, remaining)
+			if remaining > 0 {
+				if _, err := f.ReadAt(rest, validBytes+frameHeaderLen); err != nil && err != io.EOF {
+					return validBytes, fmt.Errorf("wal: replay strict %s: read tail: %w", path, err)
+				}
+			}
+			allZero := true
+			for _, b := range rest {
+				if b != 0 {
+					allZero = false
+					break
+				}
+			}
+			if allZero {
+				return validBytes, nil
+			}
+			return validBytes, fmt.Errorf("wal: replay strict %s at offset %d: zero-length frame with non-zero tail: %w",
+				path, validBytes, base.ErrCorruption)
+		}
+		if payloadLen > MaxPayloadSize || int64(payloadLen) > remaining {
+			return validBytes, nil // declared length past EOF: torn tail
+		}
+		if int64(cap(payload)) < int64(payloadLen) {
+			payload = make([]byte, payloadLen)
+		} else {
+			payload = payload[:payloadLen]
+		}
+		if _, err := f.ReadAt(payload, validBytes+frameHeaderLen); err != nil {
+			return validBytes, fmt.Errorf("wal: replay strict %s: read payload: %w", path, err)
+		}
+		if got := base.CRC(payload); got != wantCRC {
+			frameEnd := validBytes + frameHeaderLen + int64(payloadLen)
+			if frameEnd == fileSize {
+				return validBytes, nil // final frame torn
+			}
+			return validBytes, fmt.Errorf("wal: replay strict %s at offset %d: crc mismatch with data after the frame: %w",
+				path, validBytes, base.ErrCorruption)
+		}
+		if err := fn(payload); err != nil {
+			return validBytes, fmt.Errorf("wal: replay strict %s: callback: %w", path, err)
+		}
+		validBytes += frameHeaderLen + int64(payloadLen)
+	}
+}

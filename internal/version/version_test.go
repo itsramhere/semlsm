@@ -1,6 +1,7 @@
 package version
 
 import (
+	"errors"
 	"testing"
 
 	"semlsm/internal/base"
@@ -22,10 +23,11 @@ func fm(level int, num uint64, smallest, largest string) manifest.FileMeta {
 
 func TestVersionApplySequence(t *testing.T) {
 	vs := NewVersionSet()
-	v0 := vs.Current()
-	if v0 == nil || v0.Refs() != 1 {
-		t.Fatal("initial version must exist with 1 ref")
+	v0 := vs.Acquire()
+	if v0 == nil || v0.Refs() != 2 { // set's ref + ours
+		t.Fatalf("initial version refs = %d, want 2", v0.Refs())
 	}
+	v0.Unref() // release ours; the set keeps its own
 
 	// add L0 file
 	v1, err := vs.Apply(&manifest.Edit{
@@ -35,15 +37,17 @@ func TestVersionApplySequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(v1.Levels[0]) != 1 || v1.Levels[0][0].Num != 1 {
-		t.Fatalf("v1 L0 wrong: %+v", v1.Levels[0])
+	cur := vs.Acquire()
+	if len(cur.Levels[0]) != 1 || cur.Levels[0][0].Num != 1 {
+		t.Fatalf("v1 L0 wrong: %+v", cur.Levels[0])
 	}
-	if vs.Current() != v1 {
-		t.Fatal("current must advance")
+	cur.Unref()
+	if v1 == nil {
+		t.Fatal("Apply must return the new version handle for tests")
 	}
 
 	// add L1 files out of key order; must come back sorted
-	v2, err := vs.Apply(&manifest.Edit{
+	_, err = vs.Apply(&manifest.Edit{
 		NextFileNum: 4,
 		AddFiles: []manifest.FileMeta{
 			fm(1, 3, "x", "z"),
@@ -53,15 +57,17 @@ func TestVersionApplySequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(v2.Levels[1]) != 2 {
+	cur = vs.Acquire()
+	if len(cur.Levels[1]) != 2 {
 		t.Fatalf("v2 L1 wrong")
 	}
-	if base.UserKey(v2.Levels[1][0].Smallest)[0] != 'd' {
-		t.Fatalf("L1 not sorted by smallest: %q", v2.Levels[1][0].Smallest)
+	if base.UserKey(cur.Levels[1][0].Smallest)[0] != 'd' {
+		t.Fatalf("L1 not sorted by smallest: %q", cur.Levels[1][0].Smallest)
 	}
+	cur.Unref()
 
 	// L0 sorted by file number descending (newest first)
-	v3, err := vs.Apply(&manifest.Edit{
+	_, err = vs.Apply(&manifest.Edit{
 		NextFileNum: 6,
 		AddFiles: []manifest.FileMeta{
 			fm(0, 5, "aa", "ab"),
@@ -71,26 +77,30 @@ func TestVersionApplySequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(v3.Levels[0]) != 3 || v3.Levels[0][0].Num != 5 || v3.Levels[0][1].Num != 4 || v3.Levels[0][2].Num != 1 {
-		t.Fatalf("L0 order wrong: %d,%d,%d", v3.Levels[0][0].Num, v3.Levels[0][1].Num, v3.Levels[0][2].Num)
+	cur = vs.Acquire()
+	if len(cur.Levels[0]) != 3 || cur.Levels[0][0].Num != 5 || cur.Levels[0][1].Num != 4 || cur.Levels[0][2].Num != 1 {
+		t.Fatalf("L0 order wrong: %d,%d,%d", cur.Levels[0][0].Num, cur.Levels[0][1].Num, cur.Levels[0][2].Num)
 	}
+	cur.Unref()
 
 	// delete file 1
-	v4, err := vs.Apply(&manifest.Edit{
+	_, err = vs.Apply(&manifest.Edit{
 		NextFileNum: 7,
 		DelFiles:    []manifest.DelFile{{Level: 0, Num: 1}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range v4.Levels[0] {
+	cur = vs.Acquire()
+	for _, f := range cur.Levels[0] {
 		if f.Num == 1 {
 			t.Fatal("file 1 must be deleted")
 		}
 	}
+	cur.Unref()
 
 	// delete a checkpoint
-	v5, err := vs.Apply(&manifest.Edit{
+	_, err = vs.Apply(&manifest.Edit{
 		NextFileNum: 8,
 		AddCkpts: []manifest.CkptFile{{
 			FileNum: 10,
@@ -100,23 +110,23 @@ func TestVersionApplySequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(v5.Ckpts.ByNum) != 1 {
-		t.Fatalf("ckpt add failed: %+v", v5.Ckpts.ByNum)
+	cur = vs.Acquire()
+	if len(cur.Ckpts.ByNum) != 1 {
+		t.Fatalf("ckpt add failed: %+v", cur.Ckpts.ByNum)
 	}
-	v6, err := vs.Apply(&manifest.Edit{
+	cur.Unref()
+	_, err = vs.Apply(&manifest.Edit{
 		NextFileNum: 9,
 		DelCkpts:    []uint64{10},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(v6.Ckpts.ByNum) != 0 {
+	cur = vs.Acquire()
+	if len(cur.Ckpts.ByNum) != 0 {
 		t.Fatal("ckpt delete failed")
 	}
-	_ = v0
-	_ = v2
-	_ = v4
-	_ = v6
+	cur.Unref()
 }
 
 func TestVersionOverlapRejected(t *testing.T) {
@@ -136,7 +146,7 @@ func TestVersionOverlapRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("overlapping L1 files must be rejected")
 	}
-	// touching boundaries: largest(a..f) == smallest(f..) overlaps on the user key
+	// touching boundaries overlap on the user key
 	_, err = vs.Apply(&manifest.Edit{
 		NextFileNum: 4,
 		AddFiles:    []manifest.FileMeta{fm(1, 3, "f", "h")},
@@ -166,8 +176,8 @@ func TestVersionRefCountAndObsolete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// an old Version keeps files alive until unref
-	v1.Ref() // simulate a reader holding it
+	// an old Version keeps files alive until unref (reader holds it)
+	v1.Ref()
 
 	_, err = vs.Apply(&manifest.Edit{
 		NextFileNum: 3,
@@ -176,12 +186,11 @@ func TestVersionRefCountAndObsolete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(vs.TakeObsolete()) != 0 {
-		t.Fatal("file 1 is still referenced by v1: not obsolete")
+	if got := vs.TakeObsolete(); len(got) != 0 {
+		t.Fatalf("file 1 is still referenced by v1: obsolete = %+v", got)
 	}
 
-	v1.Unref() // drop the reader ref
-	v1.Unref() // drop the set's ref -> version dead -> file obsolete
+	v1.Unref() // drop the reader ref; Apply already dropped the set's ref
 	obs := vs.TakeObsolete()
 	if len(obs) != 1 || obs[0].Num != 1 {
 		t.Fatalf("obsolete = %+v, want file 1", obs)
@@ -209,8 +218,148 @@ func TestVersionUnchangedFilesShared(t *testing.T) {
 	if shared == nil || shared != v1.Levels[0][0] {
 		t.Fatal("unchanged file instance must be shared")
 	}
-	// v2 holds 2 files, v1 holds 1
 	if vs.VersionCount() != 2 {
 		t.Fatalf("live = %d, want 2", vs.VersionCount())
+	}
+}
+
+// M-010 focus: a version held across several Applies, unref in either order,
+// obsolete exactly once.
+func TestVersionHeldAcrossApplies(t *testing.T) {
+	vs := NewVersionSet()
+	v0, err := vs.Apply(&manifest.Edit{NextFileNum: 2, AddFiles: []manifest.FileMeta{fm(0, 1, "a", "c")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v0.Ref() // reader pin
+
+	// several applies that delete file 1 and add others
+	for i := uint64(2); i <= 5; i++ {
+		if _, err := vs.Apply(&manifest.Edit{
+			NextFileNum: i + 1,
+			AddFiles:    []manifest.FileMeta{fm(0, i, "aa", "az")},
+			DelFiles:    []manifest.DelFile{{Level: 0, Num: i - 1}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// after these edits, files 1..4 are gone from the tree; the unpinned
+	// intermediate versions (2,3,4) died immediately and are obsolete; file 1
+	// is still pinned by v0
+	if got := vs.TakeObsolete(); len(got) != 3 {
+		t.Fatalf("intermediate files should be obsolete: %+v", got)
+	}
+
+	// file 5 stays live in the current version
+	cur := vs.Acquire()
+	if len(cur.Levels[0]) != 1 || cur.Levels[0][0].Num != 5 {
+		t.Fatalf("current L0 wrong: %+v", cur.Levels[0])
+	}
+	cur.Unref()
+
+	// release the pin: file 1 becomes obsolete exactly once
+	v0.Unref() // reader pin; the set's ref was dropped when v0 was replaced
+	obs := vs.TakeObsolete()
+	if len(obs) != 1 || obs[0].Num != 1 {
+		t.Fatalf("obsolete = %+v, want exactly file 1", obs)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("double unref must panic")
+		}
+	}()
+	v0.Unref() // v0 is dead: must panic
+}
+
+func TestVersionUnrefEitherOrder(t *testing.T) {
+	// Two pinned versions sharing files, released in the opposite order.
+	vs := NewVersionSet()
+	vA, err := vs.Apply(&manifest.Edit{NextFileNum: 2, AddFiles: []manifest.FileMeta{fm(0, 1, "a", "c")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vA.Ref()
+	vB, err := vs.Apply(&manifest.Edit{NextFileNum: 3, AddFiles: []manifest.FileMeta{fm(1, 2, "d", "f")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vB.Ref() // pinned while file 1 is already deleted from the tree
+
+	if got := vs.TakeObsolete(); len(got) != 0 {
+		t.Fatalf("both pins hold their files: %+v", got)
+	}
+	// release in reverse creation order. vB holds set ref + reader pin (2);
+	// releasing both kills it. vA lost its set ref when replaced, so one
+	// Unref kills it.
+	vB.Unref()
+	vB.Unref()
+	if got := vs.TakeObsolete(); len(got) != 1 || got[0].Num != 2 {
+		t.Fatalf("obsolete = %+v, want file 2", got)
+	}
+	vA.Unref()
+	obs := vs.TakeObsolete()
+	if len(obs) != 1 || obs[0].Num != 1 {
+		t.Fatalf("obsolete = %+v, want file 1", obs)
+	}
+}
+
+func TestVersionRefPanicsOnDead(t *testing.T) {
+	vs := NewVersionSet()
+	v, _ := vs.Apply(&manifest.Edit{NextFileNum: 2, AddFiles: []manifest.FileMeta{fm(0, 1, "a", "c")}})
+	// replace v: the set's ref moves to the new version and v dies (refs 0)
+	if _, err := vs.Apply(&manifest.Edit{NextFileNum: 3, AddFiles: []manifest.FileMeta{fm(0, 2, "d", "f")}}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Ref on dead version must panic")
+		}
+	}()
+	v.Ref()
+}
+
+func TestVersionRejectsBadEdits(t *testing.T) {
+	// M-011 item 5
+	vs := NewVersionSet()
+	if _, err := vs.Apply(&manifest.Edit{NextFileNum: 2, AddFiles: []manifest.FileMeta{fm(0, 1, "a", "c")}}); err != nil {
+		t.Fatal(err)
+	}
+	// add of a live num
+	if _, err := vs.Apply(&manifest.Edit{NextFileNum: 3, AddFiles: []manifest.FileMeta{fm(0, 1, "a", "c")}}); !errors.Is(err, base.ErrCorruption) {
+		t.Fatalf("add of live file: err=%v", err)
+	}
+	// del of an unknown num
+	if _, err := vs.Apply(&manifest.Edit{NextFileNum: 3, DelFiles: []manifest.DelFile{{Level: 0, Num: 99}}}); !errors.Is(err, base.ErrCorruption) {
+		t.Fatalf("del of unknown file: err=%v", err)
+	}
+	// del with mismatched level
+	if _, err := vs.Apply(&manifest.Edit{NextFileNum: 3, DelFiles: []manifest.DelFile{{Level: 1, Num: 1}}}); !errors.Is(err, base.ErrCorruption) {
+		t.Fatalf("del level mismatch: err=%v", err)
+	}
+	// nothing changed
+	cur := vs.Acquire()
+	if len(cur.Levels[0]) != 1 || cur.Levels[0][0].Num != 1 {
+		t.Fatalf("failed edits must change nothing: %+v", cur.Levels[0])
+	}
+	cur.Unref()
+}
+
+func TestVersionCountersTakeMax(t *testing.T) {
+	// M-011 item 2
+	vs := NewVersionSet()
+	if _, err := vs.Apply(&manifest.Edit{NextFileNum: 100, LastTs: 500, LogNum: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vs.Apply(&manifest.Edit{NextFileNum: 90, LastTs: 400, LogNum: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if vs.NextFileNum != 100 || vs.LastTs != 500 || vs.LogNum != 7 {
+		t.Fatalf("counters regressed: %d/%d/%d", vs.NextFileNum, vs.LastTs, vs.LogNum)
+	}
+	if _, err := vs.Apply(&manifest.Edit{NextFileNum: 200, LastTs: 900, LogNum: 9}); err != nil {
+		t.Fatal(err)
+	}
+	if vs.NextFileNum != 200 || vs.LastTs != 900 || vs.LogNum != 9 {
+		t.Fatalf("counters did not advance: %d/%d/%d", vs.NextFileNum, vs.LastTs, vs.LogNum)
 	}
 }

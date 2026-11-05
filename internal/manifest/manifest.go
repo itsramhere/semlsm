@@ -116,11 +116,13 @@ func (w *Writer) Close() error {
 // Size returns bytes written so far.
 func (w *Writer) Size() int64 { return w.size }
 
-// ReadAll replays all edits from a manifest. A torn tail (the final frame) is
-// ignored, like in the WAL. JSON corruption of a complete frame is an error.
+// ReadAll replays all edits from a manifest under the strict recovery rules
+// (M-011 item 1): only the final frame may be torn; a bad CRC with data
+// after it is corruption, because live files could otherwise be mistaken
+// for orphans and deleted. JSON corruption of a complete frame is an error.
 func ReadAll(fs vfs.FS, path string) ([]Edit, error) {
 	var edits []Edit
-	_, err := wal.Replay(fs, path, true, func(payload []byte) error {
+	_, err := wal.ReplayStrict(fs, path, func(payload []byte) error {
 		var e Edit
 		if err := json.Unmarshal(payload, &e); err != nil {
 			return fmt.Errorf("manifest: decode %s: %w", path, base.ErrCorruption)

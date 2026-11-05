@@ -1,6 +1,9 @@
 package version
 
 import (
+	"errors"
+	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -22,13 +25,15 @@ type ObsoleteDeleter struct {
 	fs         vfs.FS
 	tc         *sstable.TableCache // optional; may be nil
 	retryDelay time.Duration       // base delay; doubles per retry
+	logger     *slog.Logger
 
-	mu     sync.Mutex
-	queue  []ObsoleteFile
-	failed []ObsoleteFile
-	wake   chan struct{}
-	done   chan struct{}
-	wg     sync.WaitGroup
+	mu       sync.Mutex
+	queue    []ObsoleteFile
+	failed   []ObsoleteFile
+	wake     chan struct{}
+	stopOnce sync.Once
+	done     chan struct{}
+	wg       sync.WaitGroup
 }
 
 // NewObsoleteDeleter builds a deleter. retryDelay <= 0 defaults to 100ms;
@@ -37,12 +42,21 @@ func NewObsoleteDeleter(fs vfs.FS, tc *sstable.TableCache, retryDelay time.Durat
 	if retryDelay <= 0 {
 		retryDelay = 100 * time.Millisecond
 	}
+	logger := slog.New(slog.DiscardHandler)
 	return &ObsoleteDeleter{
 		fs:         fs,
 		tc:         tc,
 		retryDelay: retryDelay,
+		logger:     logger,
 		wake:       make(chan struct{}, 1),
 		done:       make(chan struct{}),
+	}
+}
+
+// SetLogger attaches a logger for failure reports.
+func (od *ObsoleteDeleter) SetLogger(l *slog.Logger) {
+	if l != nil {
+		od.logger = l
 	}
 }
 
@@ -65,7 +79,9 @@ func (od *ObsoleteDeleter) Start() {
 
 // Stop signals the worker to exit after its current file and waits for it.
 func (od *ObsoleteDeleter) Stop() {
-	close(od.done)
+	od.stopOnce.Do(func() {
+		close(od.done)
+	})
 	od.wg.Wait()
 }
 
@@ -125,6 +141,8 @@ func (od *ObsoleteDeleter) loop() {
 }
 
 // deleteOne evicts the cache entry and removes the file with retries.
+// A missing file counts as success (M-011 item 6): replaying add-then-delete
+// edits at recovery must not burn retries on already-removed files.
 func (od *ObsoleteDeleter) deleteOne(f ObsoleteFile) {
 	if od.tc != nil && !f.IsCkpt {
 		od.tc.Evict(f.Num)
@@ -132,11 +150,11 @@ func (od *ObsoleteDeleter) deleteOne(f ObsoleteFile) {
 	delay := od.retryDelay
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
-		if err := od.fs.Remove(f.Path); err == nil {
+		err := od.fs.Remove(f.Path)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
 			return
-		} else {
-			lastErr = err
 		}
+		lastErr = err
 		if attempt < 4 {
 			time.Sleep(delay)
 			delay *= 2
@@ -145,5 +163,8 @@ func (od *ObsoleteDeleter) deleteOne(f ObsoleteFile) {
 	od.mu.Lock()
 	od.failed = append(od.failed, f)
 	od.mu.Unlock()
-	_ = lastErr
+	if lastErr != nil {
+		od.logger.Warn("obsolete file deletion failed after retries",
+			"path", f.Path, "num", f.Num, "err", lastErr)
+	}
 }

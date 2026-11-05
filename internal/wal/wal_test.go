@@ -432,3 +432,73 @@ func TestWriterSizeAccounting(t *testing.T) {
 		t.Fatalf("size=%d", w.Size())
 	}
 }
+
+func TestReplayStrict(t *testing.T) {
+	p1 := encodeBatch(t, 1, []base.Record{rec("a", 1, base.KindPut, "v1")})
+	p2 := encodeBatch(t, 2, []base.Record{rec("b", 2, base.KindPut, "v2-longer")})
+	p3 := encodeBatch(t, 3, []base.Record{rec("c", 3, base.KindPut, "v3-longest-payload")})
+	fs := writeWALFile(t, p1, p2, p3)
+	full := readAllWAL(t, fs, "wal")
+	start2 := int64(frameHeaderLen + len(p1))
+	start3 := start2 + int64(frameHeaderLen+len(p2))
+
+	count := func(fsys vfs.FS) (int, error) {
+		n := 0
+		_, err := ReplayStrict(fsys, "wal", func(p []byte) error { n++; return nil })
+		return n, err
+	}
+
+	// clean file: 3 frames, no error
+	if n, err := count(fs); err != nil || n != 3 {
+		t.Fatalf("clean: n=%d err=%v", n, err)
+	}
+
+	// torn tail at every byte of the final frame: earlier frames survive,
+	// no error
+	for off := start3; off < int64(len(full)); off++ {
+		trimmed := truncateCopy(t, fs, off)
+		if n, err := count(trimmed); err != nil || n != 2 {
+			t.Fatalf("tail tear at %d: n=%d err=%v", off, n, err)
+		}
+	}
+
+	// bad CRC in a NON-final frame with bytes after it: ErrCorruption
+	corrupt := append([]byte(nil), full...)
+	corrupt[start2+frameHeaderLen+2] ^= 0x01
+	cfs := vfs.NewMemFS()
+	fc, _ := cfs.Create("wal")
+	fc.Write(corrupt)
+	fc.Close()
+	if _, err := ReplayStrict(cfs, "wal", func(p []byte) error { return nil }); !errors.Is(err, base.ErrCorruption) {
+		t.Fatalf("mid-file CRC corruption: err=%v, want ErrCorruption", err)
+	}
+
+	// short header at the tail: torn
+	for off := int64(1); off < int64(frameHeaderLen); off++ {
+		trimmed := truncateCopy(t, fs, start3+off)
+		if n, err := count(trimmed); err != nil || n != 2 {
+			t.Fatalf("short header at %d: n=%d err=%v", off, n, err)
+		}
+	}
+
+	// zero-filled tail: torn, earlier frames survive
+	zfs := vfs.NewMemFS()
+	fz, _ := zfs.Create("wal")
+	fz.Write(full[:start3])
+	fz.Write(make([]byte, 64))
+	fz.Close()
+	if n, err := count(zfs); err != nil || n != 2 {
+		t.Fatalf("zero tail: n=%d err=%v", n, err)
+	}
+
+	// zero-length frame with non-zero garbage after: ErrCorruption
+	gfs := vfs.NewMemFS()
+	fg, _ := gfs.Create("wal")
+	fg.Write(full[:start3])
+	fg.Write(make([]byte, 8)) // zero-length frame header
+	fg.Write([]byte("garbage here"))
+	fg.Close()
+	if _, err := ReplayStrict(gfs, "wal", func(p []byte) error { return nil }); !errors.Is(err, base.ErrCorruption) {
+		t.Fatalf("zero-length frame with garbage: err=%v, want ErrCorruption", err)
+	}
+}
