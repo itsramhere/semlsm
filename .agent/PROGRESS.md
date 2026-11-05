@@ -36,10 +36,12 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
   8 TestFSContract runs one scenario against OSFS and MemFS (M-004 item 8).
 
 ## P2. WAL and memtable
-- [ ] **P2.1** `internal/wal`: `Writer{Append(payload), Sync, Close, Size}`; `Replay(file, last bool, fn) (validBytes int64, err)`. Encode and decode batch payload. Tests: round trip; torn at every byte offset of the final frame (loop over all prefixes): the last-WAL mode returns all earlier frames and no error; flipped byte: `ErrCorruption` in non-last mode; a max-size frame; an oversized length field doesn't allocate huge memory (check against the remaining file size before allocating).
-- [ ] **P2.2** `internal/memtable`: skiplist per B7, max height 12, branching 1/4, deterministic RNG. `Add(ikey, value)`, `Get(user, S) (ts, kind, value, ok)`, `Iterator` (`SeekGE, First, Next, Valid, Key, Value`), `ApproxBytes`. Tests: compared with a sorted slice model over 100k random ops; a concurrent test with 1 writer and 8 readers where readers assert monotonic order and no torn values.
+- [x] **P2.1** `internal/wal`: ... (full text in plan)
+  -> wal.go (Writer Append/Sync/Close/Size, Replay with last-WAL torn-tail rule, size check before allocation), batch.go (EncodeBatch/DecodeBatch, copies on decode). 11 tests: round trip, torn at every offset of final frame (last=true ok / last=false ErrCorruption), torn header offsets, flipped byte, max-size frame, oversized length field, size accounting, codec table + malformed.
+- [x] **P2.2** `internal/memtable`: skiplist per B7
+  -> memtable.go: max height 12, branching 1/4, deterministic RNG (seed 0x5EED5EED, mutex-guarded); Add copies key/value; Get via SeekKey; Iterator SeekGE/First/Next/Valid/Key/Value; ApproxBytes/Len; atomic.Pointer towers, nodes immutable. 4 tests incl. 100k-op model comparison (seed logged on failure) and 1-writer/8-readers concurrency (order + no torn values), passed with -race.
 
-**Gate 2:** pass, including the concurrent test with `-race` or `-count=20`.
+**Gate 2:** pass, including the concurrent test with `-race` or `-count=20`. — see G-006.
 
 ## P3. SSTable
 - [ ] **P3.1** `internal/bloom`: per B8. Test: no false negatives over 100k keys; false positive rate below 2%.
