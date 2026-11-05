@@ -231,3 +231,100 @@ func labelM(ikey []byte) string {
 func mkEntryM(user string, ts uint64) modelEntry {
 	return modelEntry{base.MakeInternalKey([]byte(user), ts, base.KindPut), []byte("v"), 0}
 }
+
+// --- M-008 item 2 remediation tests ---
+
+func TestMergeReseekAfterExhaustion(t *testing.T) {
+	// a) SeekGE past the end, then SeekGE to a valid key must work.
+	a := []modelEntry{mkEntryM("a", 1), mkEntryM("b", 2)}
+	b := []modelEntry{mkEntryM("c", 3)}
+	m := New(newSliceIter(a), newSliceIter(b))
+	m.SeekGE(base.SeekKey([]byte("zz"), 1))
+	if m.Valid() {
+		t.Fatal("seek past end must be invalid")
+	}
+	m.SeekGE(base.SeekKey([]byte("a"), 10)) // re-seek to a valid key
+	if !m.Valid() || string(base.UserKey(m.Key())) != "a" {
+		t.Fatalf("re-seek after exhaustion: valid=%v key=%v", m.Valid(), m.Key())
+	}
+	m.Next()
+	if !m.Valid() || string(base.UserKey(m.Key())) != "b" {
+		t.Fatalf("re-seek lost source: valid=%v", m.Valid())
+	}
+	m.Next()
+	if !m.Valid() || string(base.UserKey(m.Key())) != "c" {
+		t.Fatalf("re-seek lost second source: valid=%v", m.Valid())
+	}
+	m.Close()
+}
+
+func TestMergeFirstAfterFullScan(t *testing.T) {
+	// b) Full scan, then First must see everything again.
+	a := []modelEntry{mkEntryM("a", 1), mkEntryM("b", 2)}
+	m := New(newSliceIter(a))
+	m.First()
+	for m.Valid() {
+		m.Next()
+	}
+	m.First()
+	n := 0
+	for ; m.Valid(); m.Next() {
+		n++
+	}
+	if n != 2 {
+		t.Fatalf("First after full scan saw %d entries, want 2", n)
+	}
+	m.Close()
+}
+
+type countingCloseIter struct {
+	inner  *sliceIter
+	closes int
+}
+
+func (c *countingCloseIter) First()          { c.inner.First() }
+func (c *countingCloseIter) SeekGE(k []byte) { c.inner.SeekGE(k) }
+func (c *countingCloseIter) Next()           { c.inner.Next() }
+func (c *countingCloseIter) Valid() bool     { return c.inner.Valid() }
+func (c *countingCloseIter) Key() []byte     { return c.inner.Key() }
+func (c *countingCloseIter) Value() []byte   { return c.inner.Value() }
+func (c *countingCloseIter) Err() error      { return c.inner.Err() }
+func (c *countingCloseIter) Close() error {
+	c.closes++
+	return nil
+}
+
+func TestMergeCloseClosesAllSources(t *testing.T) {
+	// c) Close after a full scan must reach every source exactly once,
+	// and be idempotent.
+	a := newSliceIter([]modelEntry{mkEntryM("a", 1)})
+	b := newSliceIter([]modelEntry{mkEntryM("b", 2)})
+	ca := &countingCloseIter{inner: a}
+	cb := &countingCloseIter{inner: b}
+	m := New(ca, cb)
+	m.First()
+	for m.Valid() {
+		m.Next()
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m.Close() // idempotent
+	if ca.closes != 1 || cb.closes != 1 {
+		t.Fatalf("closes: src0=%d src1=%d, want 1/1", ca.closes, cb.closes)
+	}
+}
+
+func TestMergeCloseAfterError(t *testing.T) {
+	// An errored source must still be closed.
+	boom := fmt.Errorf("boom")
+	src := &errorIter{inner: newSliceIter([]modelEntry{mkEntryM("a", 1)}), maxSteps: 0, sentinel: boom}
+	m := New(src)
+	m.First() // error immediately
+	if m.Err() == nil {
+		t.Fatal("expected error on First")
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}

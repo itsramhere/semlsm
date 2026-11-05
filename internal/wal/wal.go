@@ -152,3 +152,13 @@ func Replay(fs vfs.FS, path string, last bool, fn func(payload []byte) error) (v
 		validBytes += frameHeaderLen + int64(payloadLen)
 	}
 }
+
+// Frame builds one on-disk frame (header + payload) without writing it.
+// Used by the manifest, whose frames share the WAL format.
+func Frame(payload []byte) []byte {
+	frame := make([]byte, frameHeaderLen+len(payload))
+	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(frame[4:8], base.CRC(payload))
+	copy(frame[frameHeaderLen:], payload)
+	return frame
+}

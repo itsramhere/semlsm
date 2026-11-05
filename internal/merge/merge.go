@@ -41,64 +41,59 @@ func (h *srcHeap) Pop() any     { old := *h; n := len(old); x := old[n-1]; *h = 
 
 // mergingIter merges sources in internal-key order. Equal keys from
 // different sources are emitted in source order (stable).
+//
+// All sources are kept in srcs for the iterator's whole life: re-seeks
+// rebuild the heap from srcs, and Close reaches every source exactly once
+// (M-008 item 2).
 type mergingIter struct {
-	heap  srcHeap
-	valid bool
-	err   error
+	srcs   []*srcItem // immutable after New
+	heap   srcHeap
+	valid  bool
+	err    error
+	closed bool
 }
 
-// New returns a merged iterator over srcs. Empty sources are skipped.
+// New returns a merged iterator over srcs. Nil sources are skipped during
+// positioning but all non-nil sources remain owned for Close.
 func New(srcs ...Iter) Iter {
 	m := &mergingIter{}
 	for i, s := range srcs {
 		if s == nil {
 			continue
 		}
-		m.heap = append(m.heap, &srcItem{it: s, idx: i})
+		m.srcs = append(m.srcs, &srcItem{it: s, idx: i})
 	}
 	return m
 }
 
-// First positions every source at its start and builds the heap.
-func (m *mergingIter) First() {
+// rebuild repositions every source with fn and rebuilds the heap from srcs.
+func (m *mergingIter) rebuild(fn func(Iter)) {
 	m.err = nil
-	alive := m.heap[:0]
-	for _, s := range m.heap {
-		s.it.First()
+	m.heap = m.heap[:0]
+	for _, s := range m.srcs {
+		fn(s.it)
 		if e := s.it.Err(); e != nil {
 			m.err = fmt.Errorf("merge: source %d: %w", s.idx, e)
 			m.valid = false
-			m.heap = alive
+			m.heap = m.heap[:0]
 			return
 		}
 		if s.it.Valid() {
-			alive = append(alive, s)
+			m.heap = append(m.heap, s)
 		}
 	}
-	m.heap = alive
 	heap.Init(&m.heap)
 	m.valid = len(m.heap) > 0
 }
 
+// First positions every source at its start and rebuilds the heap.
+func (m *mergingIter) First() {
+	m.rebuild(func(it Iter) { it.First() })
+}
+
 // SeekGE repositions every source and rebuilds the heap.
 func (m *mergingIter) SeekGE(target []byte) {
-	m.err = nil
-	alive := m.heap[:0]
-	for _, s := range m.heap {
-		s.it.SeekGE(target)
-		if e := s.it.Err(); e != nil {
-			m.err = fmt.Errorf("merge: source %d: %w", s.idx, e)
-			m.valid = false
-			m.heap = alive
-			return
-		}
-		if s.it.Valid() {
-			alive = append(alive, s)
-		}
-	}
-	m.heap = alive
-	heap.Init(&m.heap)
-	m.valid = len(m.heap) > 0
+	m.rebuild(func(it Iter) { it.SeekGE(target) })
 }
 
 // Next advances to the next entry in merge order.
@@ -132,10 +127,14 @@ func (m *mergingIter) Value() []byte { return m.heap[0].it.Value() }
 // Err returns the first source error encountered.
 func (m *mergingIter) Err() error { return m.err }
 
-// Close closes all sources and returns the first error.
+// Close closes all sources exactly once and returns the first error.
 func (m *mergingIter) Close() error {
+	if m.closed {
+		return nil
+	}
+	m.closed = true
 	var first error
-	for _, s := range m.heap {
+	for _, s := range m.srcs {
 		if e := s.it.Close(); e != nil && first == nil {
 			first = e
 		}

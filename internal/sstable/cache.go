@@ -17,10 +17,12 @@ type TableCache struct {
 }
 
 type tableEntry struct {
-	r       *Reader
-	refs    int
-	elem    *list.Element
-	removed bool // evicted via Evict; close on last release
+	num      uint64
+	r        *Reader
+	refs     int
+	elem     *list.Element
+	removed  bool // evicted via Evict or capacity; close on last release
+	released bool // release idempotence
 }
 
 // NewTableCache builds a cache with the given capacity and opener.
@@ -37,38 +39,42 @@ func NewTableCache(capacity int, open func(num uint64) (*Reader, error)) *TableC
 }
 
 // Get returns the reader for num with one reference held.
-// The caller MUST call release when done.
+// The caller MUST call release when done (exactly once).
 func (tc *TableCache) Get(num uint64) (r *Reader, release func(), err error) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if e, ok := tc.m[num]; ok {
 		tc.lru.MoveToFront(e.elem)
 		e.refs++
-		return e.r, tc.releaseFunc(num), nil
+		return e.r, tc.releaseFunc(e), nil
 	}
 	r, err = tc.open(num)
 	if err != nil {
 		return nil, nil, err
 	}
-	e := &tableEntry{r: r, refs: 1}
-	e.elem = tc.lru.PushFront(num)
+	e := &tableEntry{num: num, r: r, refs: 1}
+	e.elem = tc.lru.PushFront(e)
 	tc.m[num] = e
 	tc.evictLocked()
-	return r, tc.releaseFunc(num), nil
+	return r, tc.releaseFunc(e), nil
 }
 
-func (tc *TableCache) releaseFunc(num uint64) func() {
+// releaseFunc captures the entry itself (M-008 item 1): a release after the
+// entry was evicted must still reach it, and must not touch a newer entry
+// registered under the same file number.
+func (tc *TableCache) releaseFunc(e *tableEntry) func() {
 	return func() {
 		tc.mu.Lock()
 		defer tc.mu.Unlock()
-		e, ok := tc.m[num]
-		if !ok {
-			return
+		if e.released {
+			return // idempotent
 		}
+		e.released = true
 		e.refs--
 		if e.refs == 0 && e.removed {
-			tc.closeLocked(num)
+			tc.closeEntry(e)
 		}
+		tc.evictLocked() // capacity pressure may now be resolvable
 	}
 }
 
@@ -85,52 +91,35 @@ func (tc *TableCache) Evict(num uint64) {
 	delete(tc.m, num)
 	e.removed = true
 	if e.refs == 0 {
-		tc.closeEntry(e, num)
+		tc.closeEntry(e)
 	}
 }
 
 // evictLocked drops least-recently-used unreferenced entries over capacity.
 func (tc *TableCache) evictLocked() {
 	for len(tc.m) > tc.capacity {
-		// find the back element whose entry has refs == 0
-		var victim uint64
-		found := false
+		var victim *tableEntry
 		for elem := tc.lru.Back(); elem != nil; elem = elem.Prev() {
-			num := elem.Value.(uint64)
-			if e := tc.m[num]; e != nil && e.refs == 0 {
-				victim = num
-				found = true
+			cand := elem.Value.(*tableEntry)
+			if cand.refs == 0 && !cand.removed {
+				victim = cand
 				break
 			}
 		}
-		if !found {
-			return // all entries are referenced; try again on release
+		if victim == nil {
+			return // all entries are referenced; release retriggers eviction
 		}
-		e := tc.m[victim]
-		tc.lru.Remove(e.elem)
-		delete(tc.m, victim)
-		e.removed = true
-		tc.closeEntry(e, victim)
+		tc.lru.Remove(victim.elem)
+		delete(tc.m, victim.num)
+		victim.removed = true
+		tc.closeEntry(victim)
 	}
 }
 
-func (tc *TableCache) closeLocked(num uint64) {
-	e, ok := tc.m[num]
-	if !ok {
-		return
-	}
-	tc.lru.Remove(e.elem)
-	delete(tc.m, num)
-	tc.closeEntry(e, num)
-}
-
-func (tc *TableCache) closeEntry(e *tableEntry, num uint64) {
-	if err := e.r.Close(); err != nil {
-		// A close failure on an evicted reader must not break callers; the
-		// obsolete-file deleter retries removals (I6).
-		_ = err
-	}
-	_ = num
+func (tc *TableCache) closeEntry(e *tableEntry) {
+	// A close failure on an evicted reader must not break callers; the
+	// obsolete-file deleter retries removals (I6).
+	_ = e.r.Close()
 }
 
 // Len returns the number of cached readers.

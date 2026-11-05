@@ -1,7 +1,5 @@
 package sstable
 
-import ()
-
 // Iterator walks all entries of an SST in internal-key order.
 // Key and Value alias the current block's decoded buffer and stay valid
 // until the next positioning call; copy before retaining.
@@ -112,3 +110,25 @@ func (it *Iterator) Value() []byte { return it.blockIt.Value() }
 
 // Err returns any corruption encountered.
 func (it *Iterator) Err() error { return it.err }
+
+// Close releases the iterator's resources. Blocks are owned by the reader,
+// so this is bookkeeping only; it exists so Iterators compose with
+// merge.Iter and satisfies the interface contract.
+func (it *Iterator) Close() error {
+	it.blockIt = nil
+	it.blocki = -2
+	it.err = nil
+	return nil
+}
+
+// Compile-time check: an SST Iterator is a merge.Iter source (M-008 item 7).
+var _ interface {
+	First()
+	SeekGE(ikey []byte)
+	Next()
+	Valid() bool
+	Key() []byte
+	Value() []byte
+	Err() error
+	Close() error
+} = (*Iterator)(nil)

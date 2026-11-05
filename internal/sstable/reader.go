@@ -3,6 +3,7 @@ package sstable
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
@@ -126,10 +127,18 @@ func (w *Writer) flushBlock() error {
 	return nil
 }
 
+// ErrEmptyTable is returned by Writer.Finish when no entry was added; callers
+// must Abort instead of installing an unreadable file (M-008 item 8).
+var ErrEmptyTable = errors.New("sstable: empty table")
+
 // Finish writes all trailing sections, syncs and closes the file.
 func (w *Writer) Finish() error {
 	if w.finished {
 		return fmt.Errorf("sstable: finish %s twice", w.path)
+	}
+	if w.props.Count == 0 {
+		w.finished = true
+		return fmt.Errorf("sstable: finish %s: %w", w.path, ErrEmptyTable)
 	}
 	w.finished = true
 	if err := w.flushBlock(); err != nil {
@@ -224,6 +233,15 @@ type Reader struct {
 	indexKeys [][]byte // last internal key of each block, ascending
 	indexOffs []uint64
 	indexLens []uint64
+	fileNum   uint64      // identity for BlockCache keys (0 = uncached)
+	cache     *BlockCache // optional decoded-block cache (M-008 item 4)
+}
+
+// UseCache wires an optional decoded-block cache. fileNum identifies this
+// table in cache keys. Call before any reads.
+func (r *Reader) UseCache(fileNum uint64, bc *BlockCache) {
+	r.fileNum = fileNum
+	r.cache = bc
 }
 
 // OpenReader opens and fully validates an SST.
@@ -356,9 +374,18 @@ func (r *Reader) MayContain(user []byte) bool {
 
 // readBlock loads and parses block i.
 func (r *Reader) readBlock(i int) (*block, error) {
-	payload, err := readSection(r.f, r.indexOffs[i], r.indexLens[i])
+	off := r.indexOffs[i]
+	if r.cache != nil {
+		if data, ok := r.cache.Get(r.fileNum, off); ok {
+			return parseBlock(data)
+		}
+	}
+	payload, err := readSection(r.f, off, r.indexLens[i])
 	if err != nil {
 		return nil, fmt.Errorf("sstable: block %d %s: %w", i, r.path, err)
+	}
+	if r.cache != nil {
+		r.cache.Put(r.fileNum, off, payload)
 	}
 	blk, err := parseBlock(payload)
 	if err != nil {

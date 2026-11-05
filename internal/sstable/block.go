@@ -189,6 +189,9 @@ func (b *block) newIterator() *blockIterator {
 
 // firstEntryAt decodes the entry starting at off.
 func (b *blockIterator) decodeAt(off int) (keyEnd int, ok bool) {
+	if off < 0 || off >= len(b.blk.data) {
+		return 0, false
+	}
 	shared, n1 := binary.Uvarint(b.blk.data[off:])
 	if n1 <= 0 {
 		return 0, false
@@ -201,15 +204,27 @@ func (b *blockIterator) decodeAt(off int) (keyEnd int, ok bool) {
 	if n3 <= 0 {
 		return 0, false
 	}
-	keyStart := off + n1 + n2 + n3
-	keyEnd = keyStart + int(unshared)
-	if keyEnd+int(vlen) > len(b.blk.data) || int(shared) > len(b.key) {
+	// Bounds as uint64 before int conversion: a crafted varint must fail
+	// cleanly instead of overflowing to a negative index (M-008 item 5).
+	dataLen := uint64(len(b.blk.data))
+	if shared > dataLen || unshared > dataLen || vlen > dataLen {
+		return 0, false
+	}
+	keyStart := uint64(off) + uint64(n1+n2+n3)
+	if keyStart+unshared > dataLen {
+		return 0, false
+	}
+	endU := keyStart + unshared
+	if endU+vlen > dataLen {
+		return 0, false
+	}
+	if shared > uint64(len(b.key)) {
 		return 0, false
 	}
 	b.key = append(b.key[:0], b.key[:shared]...)
-	b.key = append(b.key, b.blk.data[keyStart:keyEnd]...)
-	b.val = b.blk.data[keyEnd : keyEnd+int(vlen)]
-	return keyEnd + int(vlen), true
+	b.key = append(b.key, b.blk.data[keyStart:endU]...)
+	b.val = b.blk.data[endU : endU+vlen]
+	return int(endU + vlen), true
 }
 
 // First positions at the first entry.
@@ -249,10 +264,15 @@ func (it *blockIterator) SeekGE(target []byte) {
 			hi = mid - 1
 		}
 	}
-	// Scan forward from `start`.
+	// Scan forward from `start`; reaching end of data is a clean miss, not
+	// corruption (M-008 item 6).
 	it.key = it.key[:0]
 	it.off = start
 	for {
+		if it.off >= len(it.blk.data) {
+			it.off = -1
+			return
+		}
 		end, ok := it.decodeAt(it.off)
 		if !ok {
 			it.off = -1
