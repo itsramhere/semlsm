@@ -6,3 +6,4 @@ Append only. One line per decision with task reference.
 - P0.1: CGO_ENABLED=1, gcc 14.2.0 present; race detector verified working in P0.4; `-race` used at gates.
 - fix(P1): contract test Stat-after-close asserts "must fail" only: os.File returns os.ErrClosed on Unix but an invalid-handle error on Windows (observed). MemFS always returns os.ErrClosed.
 - fix(P1): truncate+write contract expectation is the zero-padded os.File result: Truncate does not reset the handle offset on either OS.
+- fix(P2): R4 exception logged per M-006: TestWALTornAtEveryOffsetOfFinalFrame previously demanded ErrCorruption at a cut exactly on a frame boundary; correct semantics (replay stops cleanly at EOF) is no error and the earlier frames in both modes. Test fixed accordingly.

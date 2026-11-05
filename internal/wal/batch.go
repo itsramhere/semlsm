@@ -74,9 +74,15 @@ func DecodeBatch(payload []byte) (ts uint64, recs []base.Record, err error) {
 			return fail("missing kind")
 		}
 		r.Kind = base.Kind(kb[0])
+		if r.Kind != base.KindPut && r.Kind != base.KindDelete {
+			return fail(fmt.Sprintf("invalid kind %d", r.Kind))
+		}
 		klen, ok := readUvarint()
 		if !ok {
 			return fail("missing key length")
+		}
+		if klen == 0 {
+			return fail("empty key")
 		}
 		key, ok := readBytes(klen)
 		if !ok {
@@ -94,6 +100,9 @@ func DecodeBatch(payload []byte) (ts uint64, recs []base.Record, err error) {
 		r.Value = append([]byte(nil), val...)
 		r.Ts = ts
 		recs = append(recs, r)
+	}
+	if pos != len(rest) {
+		return fail("trailing data after records")
 	}
 	return ts, recs, nil
 }

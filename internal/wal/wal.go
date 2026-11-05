@@ -38,7 +38,12 @@ func NewWriter(fs vfs.FS, path string) (*Writer, error) {
 }
 
 // Append writes one frame: header + payload, in a single Write call.
+// An empty payload is rejected: a zero-length frame is indistinguishable from
+// a zero-filled crash tail and would break replay (M-006 item 2).
 func (w *Writer) Append(payload []byte) error {
+	if len(payload) == 0 {
+		return fmt.Errorf("wal: append %s: empty payload", w.path)
+	}
 	if len(payload) > MaxPayloadSize {
 		return fmt.Errorf("wal: append %s: %w (%d bytes)", w.path, ErrFrameTooLarge, len(payload))
 	}
@@ -108,15 +113,22 @@ func Replay(fs vfs.FS, path string, last bool, fn func(payload []byte) error) (v
 		if err != nil && err != io.EOF {
 			return validBytes, fmt.Errorf("wal: replay %s: read header: %w", path, err)
 		}
+		if n == 0 {
+			// Exactly at end of file: a clean end in both modes (M-006 item 1).
+			return validBytes, nil
+		}
 		if n < frameHeaderLen {
-			// Partial header (or nothing) left in the file.
-			if err == io.EOF || n == 0 {
-				return torn("short header")
-			}
+			// Partial header left in the file: torn tail.
 			return torn("short header")
 		}
 		payloadLen := binary.LittleEndian.Uint32(header[0:4])
 		wantCRC := binary.LittleEndian.Uint32(header[4:8])
+
+		// A zero-filled tail parses as a length-0 frame whose CRC of nothing
+		// is 0; reject it explicitly (M-006 item 2).
+		if payloadLen == 0 {
+			return torn("zero-length frame")
+		}
 
 		// Check against remaining file size BEFORE allocating.
 		remaining := fileSize - validBytes - frameHeaderLen

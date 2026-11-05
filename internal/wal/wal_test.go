@@ -173,6 +173,21 @@ func TestDecodeBatchMalformed(t *testing.T) {
 			p := encodeBatch(t, 1, []base.Record{rec("abcdefghij", 1, base.KindPut, "v")})
 			return p[:len(p)-3] // cut into the value
 		}()},
+		{"invalid kind", func() []byte {
+			p := encodeBatch(t, 1, []base.Record{rec("k", 1, base.KindPut, "v")})
+			p[9] = 7 // kind byte of the first record (8 ts + 1 count)
+			return p
+		}()},
+		{"empty key", func() []byte {
+			p := encodeBatch(t, 1, []base.Record{rec("k", 1, base.KindPut, "v")})
+			// shrink klen to 0 and drop the key byte: 8 ts, 1 count, 1 kind at [9], klen at [10]
+			p[10] = 0
+			return append(p[:11], p[12:]...)
+		}()},
+		{"trailing data", func() []byte {
+			p := encodeBatch(t, 1, []base.Record{rec("k", 1, base.KindPut, "v")})
+			return append(p, 0xAA)
+		}()},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -191,9 +206,11 @@ func TestWALTornAtEveryOffsetOfFinalFrame(t *testing.T) {
 	full := readAllWAL(t, fs, "wal")
 	start3 := int64(0) + int64(frameHeaderLen+len(p1)) + int64(frameHeaderLen+len(p2))
 
-	// Sanity: the full file replays all three frames.
-	if n, err := countFrames(t, fs, true); err != nil || n != 3 {
-		t.Fatalf("full file: n=%d err=%v, want 3", n, err)
+	// Sanity: the full file replays all three frames, in both modes.
+	for _, last := range []bool{true, false} {
+		if n, err := countFrames(t, fs, last); err != nil || n != 3 {
+			t.Fatalf("full file last=%v: n=%d err=%v, want 3 frames and no error", last, n, err)
+		}
 	}
 
 	// Every truncation that cuts at least one byte of the final frame.
@@ -211,9 +228,88 @@ func TestWALTornAtEveryOffsetOfFinalFrame(t *testing.T) {
 			t.Fatalf("offset %d: last=true: n=%d valid=%d, want 2/%d", off, n, valid, start3)
 		}
 		_, err = Replay(trimmed, "wal", false, func(p []byte) error { return nil })
-		if !errors.Is(err, base.ErrCorruption) {
+		if off == start3 {
+			// A cut exactly on a frame boundary is a clean end, not corruption
+			// (M-006 item 1; R4 exception, logged in DECISIONS.md).
+			if err != nil {
+				t.Fatalf("offset %d: last=false on boundary: err=%v, want nil", off, err)
+			}
+		} else if !errors.Is(err, base.ErrCorruption) {
 			t.Fatalf("offset %d: last=false: err=%v, want ErrCorruption", off, err)
 		}
+	}
+}
+
+func TestWALCleanEndBothModes(t *testing.T) {
+	p1 := encodeBatch(t, 1, []base.Record{rec("a", 1, base.KindPut, "v1")})
+	p2 := encodeBatch(t, 2, []base.Record{rec("b", 2, base.KindPut, "v2")})
+	fs := writeWALFile(t, p1, p2)
+	for _, last := range []bool{true, false} {
+		n, err := countFrames(t, fs, last)
+		if err != nil || n != 2 {
+			t.Fatalf("last=%v: n=%d err=%v", last, n, err)
+		}
+	}
+
+	// Empty file: clean end in both modes.
+	empty := vfs.NewMemFS()
+	f, _ := empty.Create("wal")
+	f.Close()
+	for _, last := range []bool{true, false} {
+		valid, err := Replay(empty, "wal", last, func(p []byte) error { return nil })
+		if err != nil || valid != 0 {
+			t.Fatalf("empty file last=%v: valid=%d err=%v", last, valid, err)
+		}
+	}
+}
+
+func TestWALZeroFilledTail(t *testing.T) {
+	// One real frame followed by a zero-filled crash tail: the zero bytes
+	// must parse as torn/corrupt, not as empty frames (M-006 item 2).
+	p1 := encodeBatch(t, 1, []base.Record{rec("a", 1, base.KindPut, "v1")})
+	fs := vfs.NewMemFS()
+	f, _ := fs.Create("wal")
+	f.Write(readAllWAL(t, writeWALFile(t, p1), "wal"))
+	f.Write(make([]byte, 32))
+	f.Close()
+
+	var n int
+	valid, err := Replay(fs, "wal", true, func(p []byte) error { n++; return nil })
+	if err != nil {
+		t.Fatalf("last=true: %v", err)
+	}
+	if n != 1 || valid != int64(frameHeaderLen+len(p1)) {
+		t.Fatalf("last=true: n=%d valid=%d, want 1/%d", n, valid, frameHeaderLen+len(p1))
+	}
+	_, err = Replay(fs, "wal", false, func(p []byte) error { return nil })
+	if !errors.Is(err, base.ErrCorruption) {
+		t.Fatalf("last=false: err=%v, want ErrCorruption", err)
+	}
+}
+
+func TestWALAppendRejectsEmptyPayload(t *testing.T) {
+	fs := vfs.NewMemFS()
+	w, err := NewWriter(fs, "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.Append(nil); err == nil {
+		t.Fatal("Append(nil) must fail")
+	}
+	if err := w.Append([]byte{}); err == nil {
+		t.Fatal("Append(empty) must fail")
+	}
+	// An empty BATCH still produces a valid non-empty payload (ts + count).
+	b, err := EncodeBatch(1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) == 0 {
+		t.Fatal("EncodeBatch of an empty batch must still emit the ts header")
+	}
+	if err := w.Append(b); err != nil {
+		t.Fatalf("empty batch payload must be appendable: %v", err)
 	}
 }
 
