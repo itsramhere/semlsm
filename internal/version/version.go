@@ -221,6 +221,19 @@ func (vs *VersionSet) Apply(e *manifest.Edit) (*Version, error) {
 	// earlier must never roll back the allocator, the timestamp, or the WAL
 	// pointer — reusing file numbers would overwrite live files and repeated
 	// timestamps would break I2.
+	// New file numbers in the edit also raise the allocator (M-013 item 1c):
+	// edits without NextFileNum must not let the allocator restart below
+	// numbers now in use.
+	for i := range e.AddFiles {
+		if e.AddFiles[i].Num >= vs.NextFileNum {
+			vs.NextFileNum = e.AddFiles[i].Num + 1
+		}
+	}
+	for i := range e.AddCkpts {
+		if e.AddCkpts[i].FileNum >= vs.NextFileNum {
+			vs.NextFileNum = e.AddCkpts[i].FileNum + 1
+		}
+	}
 	if e.NextFileNum > vs.NextFileNum {
 		vs.NextFileNum = e.NextFileNum
 	}
@@ -314,4 +327,21 @@ func (vs *VersionSet) releaseVersion(v *Version) {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	vs.releaseVersionLocked(v)
+}
+
+// IsCkpt reports whether the file is a checkpoint file (never for SSTs).
+func (f *FileMeta) IsCkpt() bool { return false }
+
+// CurrentLastTs returns the set's LastTs under its lock.
+func (vs *VersionSet) CurrentLastTs() uint64 {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	return vs.LastTs
+}
+
+// CurrentLogNum returns the set's LogNum under its lock.
+func (vs *VersionSet) CurrentLogNum() uint64 {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	return vs.LogNum
 }

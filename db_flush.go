@@ -8,12 +8,17 @@ import (
 	"semlsm/internal/failpoint"
 	"semlsm/internal/manifest"
 	"semlsm/internal/sstable"
+	"time"
+
 	"semlsm/internal/vfs"
 )
 
-// flushLoop drains immutable memtables into L0 SSTs (P5.4).
+// flushLoop drains immutable memtables into L0 SSTs (P5.4). On a persistent
+// error it backs off with growing sleeps (100ms doubling to 5s) instead of
+// hot-looping (M-013 item 2).
 func (db *DB) flushLoop() {
 	defer db.flushWG.Done()
+	backoff := 100 * time.Millisecond
 	for {
 		select {
 		case <-db.flushWake:
@@ -33,8 +38,20 @@ func (db *DB) flushLoop() {
 			// may hold unflushed data. Advancing log_num to the active WAL here
 			// would lose them (I1).
 			if err := db.flushOne(item, item.walNum+1); err != nil {
-				db.setFailed(err)
+				// flush failures must not fail writes (the data is safe in the
+				// WAL): log, back off, and retry (P6.2, P13.3)
+				db.logger.Warn("semlsm: flush failed", "err", err)
+				select {
+				case <-db.closeCh:
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < 5*time.Second {
+					backoff *= 2
+				}
+				continue
 			}
+			backoff = 100 * time.Millisecond
 		}
 		select {
 		case <-db.closeCh:
@@ -84,7 +101,7 @@ func (db *DB) flushOne(item immEntry, logNumToSet uint64) error {
 	if count == 0 {
 		// empty memtable: nothing to write; drop the file and install anyway
 		w.Abort()
-		db.finishFlush(item, sstNum, nil, true, logNumToSet)
+		db.finishFlush(item, sstNum, nil, true, logNumToSet, 0)
 		return nil
 	}
 	if err := w.Finish(); err != nil {
@@ -95,6 +112,7 @@ func (db *DB) flushOne(item immEntry, logNumToSet uint64) error {
 		return fmt.Errorf("semlsm: flush syncdir: %w", err)
 	}
 	if err := failpoint.Hit(fpFlushAfterSSTSync); err != nil {
+		_ = db.opts.FS.Remove(filepath.Join(db.dir, sstName(sstNum)))
 		return err
 	}
 
@@ -108,14 +126,14 @@ func (db *DB) flushOne(item immEntry, logNumToSet uint64) error {
 		MaxTs:    maxTs,
 		Count:    count,
 	}
-	return db.finishFlush(item, sstNum, &meta, false, logNumToSet)
+	return db.finishFlush(item, sstNum, &meta, false, logNumToSet, maxTs)
 }
 
 // finishFlush appends the manifest edit, installs the new version, and
 // removes the flushed memtable and its WAL (B7 order). logNumToSet (if > 0)
 // advances log_num past WALs whose data is fully durable in the SST.
-func (db *DB) finishFlush(item immEntry, sstNum uint64, meta *manifest.FileMeta, empty bool, logNumToSet uint64) error {
-	// manifest edit under manifestMu
+func (db *DB) finishFlush(item immEntry, sstNum uint64, meta *manifest.FileMeta, empty bool, logNumToSet uint64, itemMaxTs uint64) error {
+	// manifest edit under manifestMu (M-013 item 1a: one stamped helper)
 	db.manifestMu.Lock()
 	e := &manifest.Edit{}
 	if !empty {
@@ -124,17 +142,9 @@ func (db *DB) finishFlush(item immEntry, sstNum uint64, meta *manifest.FileMeta,
 	if logNumToSet > 0 {
 		e.LogNum = logNumToSet
 	}
-	if err := db.manifest.Append(e); err != nil {
+	if err := db.appendManifestLocked(e, itemMaxTs); err != nil {
 		db.manifestMu.Unlock()
 		return fmt.Errorf("semlsm: flush manifest: %w", err)
-	}
-	if err := db.manifest.Sync(); err != nil {
-		db.manifestMu.Unlock()
-		return fmt.Errorf("semlsm: flush manifest sync: %w", err)
-	}
-	if _, aerr := db.vs.Apply(e); aerr != nil {
-		db.manifestMu.Unlock()
-		return fmt.Errorf("semlsm: flush apply: %w", aerr)
 	}
 	db.manifestMu.Unlock()
 

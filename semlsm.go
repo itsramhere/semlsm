@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"semlsm/internal/base"
+	"semlsm/internal/compaction"
 	"semlsm/internal/failpoint"
 	"semlsm/internal/manifest"
 	"semlsm/internal/memtable"
@@ -97,7 +98,6 @@ type DB struct {
 	mu        sync.Mutex
 	rs        *readState
 	visibleTs uint64
-	immsCount int // mirror of len(rs.imms) for cheap stall checks
 
 	// manifestMu serializes manifest writes; lock order is manifestMu
 	// then mu.
@@ -113,10 +113,11 @@ type DB struct {
 	lastTs  uint64
 	syncCnt uint64
 
-	commitQ   chan *commitReq
-	closeCh   chan struct{}
-	commitWG  sync.WaitGroup
-	stallCond *sync.Cond
+	commitQ     chan *commitReq
+	closeCh     chan struct{}
+	compactWake chan struct{}
+	commitWG    sync.WaitGroup
+	stallCond   *sync.Cond
 
 	flushWake chan struct{} // cap 1
 	flushWG   sync.WaitGroup
@@ -138,6 +139,11 @@ type DB struct {
 	logger *slog.Logger
 
 	nextFileNum uint64 // guarded by manifestMu
+
+	picker              *compaction.Picker
+	compactWG           sync.WaitGroup
+	compactionsInFlight int
+	busy                map[uint64]bool // file numbers used by running compactions
 }
 
 // file name helpers (B8).
@@ -196,6 +202,7 @@ func Open(dir string, opts Options) (*DB, error) {
 	go db.flushLoop()
 	db.commitWG.Add(1)
 	go db.commitLoop()
+	db.startCompactionWorkers()
 
 	return db, nil
 }
@@ -231,6 +238,12 @@ func (db *DB) openRecover() error {
 
 	// Active WAL: created before replay; recovery replays older WALs and
 	// flushes them into L0 (P5.2 "simple, avoids WAL reuse").
+	// M-013 item 1d: raise the allocator above every existing file number
+	// (SSTs, WALs, ckpts, manifests) BEFORE allocating anything, so the new
+	// WAL can never truncate or shadow an old file.
+	if err := db.scanMaxFileNum(); err != nil {
+		return err
+	}
 	db.manifestMu.Lock()
 	db.walNum = db.allocateFileNum()
 	db.nextFileNumSnapshot()
@@ -338,7 +351,7 @@ func (db *DB) replayWalNums() ([]uint64, error) {
 		if !ok || suffix != ".wal" {
 			continue
 		}
-		if num >= logNum && num < db.walNum {
+		if num >= logNum && num != db.walNum {
 			nums = append(nums, num)
 		}
 	}
@@ -400,7 +413,13 @@ func (db *DB) loadOrCreateManifest() error {
 func (db *DB) rewriteManifest() error {
 	db.manifestMu.Lock()
 	defer db.manifestMu.Unlock()
+	return db.rewriteManifestLocked()
+}
 
+// rewriteManifestLocked does the manifest rewrite with manifestMu already
+// held (M-013 item 3): the whole edit is atomic with respect to other
+// manifest writers.
+func (db *DB) rewriteManifestLocked() error {
 	newNum := db.vs.NextFileNum + 1
 	if db.manifestNum > 0 {
 		newNum = db.manifestNum + 1
@@ -415,8 +434,8 @@ func (db *DB) rewriteManifest() error {
 	}
 	snap := &manifest.Edit{
 		NextFileNum: newNum + 1,
-		LastTs:      db.vs.LastTs,
-		LogNum:      db.vs.LogNum,
+		LastTs:      db.vs.CurrentLastTs(),
+		LogNum:      db.vs.CurrentLogNum(),
 	}
 	cur := db.vs.Acquire()
 	defer cur.Unref()
@@ -464,15 +483,16 @@ func (db *DB) rewriteManifest() error {
 	return nil
 }
 
-// manifestEdit appends one edit and syncs, under manifestMu.
-func (db *DB) manifestEdit(e *manifest.Edit) error {
-	db.manifestMu.Lock()
-	defer db.manifestMu.Unlock()
+// appendManifestLocked appends one edit with the allocator state stamped in
+// (M-013 item 1a), syncs it, and applies it to the VersionSet. manifestMu
+// must be held; lastTs is the edit's commit-timestamp context (a flushed
+// memtable's max ts, or the VersionSet's for non-flush edits).
+func (db *DB) appendManifestLocked(e *manifest.Edit, lastTs uint64) error {
 	e.NextFileNum = db.nextFileNum
-	e.LastTs = db.lastTs
-	e.LogNum = db.vs.LogNum
-	if e.LogNum < db.walNum {
-		e.LogNum = db.walNum
+	if lastTs > db.vs.CurrentLastTs() {
+		e.LastTs = lastTs
+	} else {
+		e.LastTs = db.vs.CurrentLastTs()
 	}
 	if err := db.manifest.Append(e); err != nil {
 		return err
@@ -490,14 +510,6 @@ func (db *DB) manifestEdit(e *manifest.Edit) error {
 	return nil
 }
 
-// rewriteManifestLocked is rewriteManifest for an already-held manifestMu.
-func (db *DB) rewriteManifestLocked() error {
-	db.manifestMu.Unlock()
-	err := db.rewriteManifest()
-	db.manifestMu.Lock()
-	return err
-}
-
 // flushRecovered flushes the recovery memtable into L0 via the normal flush
 // path; walNum 0 means "no WAL to delete" and the edit advances log_num.
 func (db *DB) flushRecovered(mt *memtable.Memtable, maxTs uint64) error {
@@ -511,14 +523,7 @@ func (db *DB) advanceLogNum() error {
 	defer db.manifestMu.Unlock()
 	e := &manifest.Edit{}
 	e.LogNum = db.walNum
-	if err := db.manifest.Append(e); err != nil {
-		return err
-	}
-	if err := db.manifest.Sync(); err != nil {
-		return err
-	}
-	_, err := db.vs.Apply(e)
-	return err
+	return db.appendManifestLocked(e, db.vs.CurrentLastTs())
 }
 
 // cleanupOrphans removes replayed WALs, files not in the manifest, and .tmp
@@ -673,4 +678,37 @@ func (db *DB) Stats() Stats {
 	s.StallTime = time.Duration(db.stallNanos.Load())
 	s.SnapshotsOpen = int(db.snapshotsOpen.Load())
 	return s
+}
+
+// scanMaxFileNum raises the allocator above every file number that exists in
+// the directory (M-013 item 1d): SSTs, WALs, ckpts and manifests.
+func (db *DB) scanMaxFileNum() error {
+	entries, err := db.opts.FS.List(db.dir)
+	if err != nil {
+		return fmt.Errorf("semlsm: scan file nums: %w", err)
+	}
+	max := db.vs.NextFileNum
+	if db.nextFileNum > max {
+		max = db.nextFileNum
+	}
+	for _, e := range entries {
+		if e.IsDir {
+			continue
+		}
+		if n, ok := manifest.ParseManifestNum(e.Name); ok {
+			if n > max {
+				max = n
+			}
+			continue
+		}
+		if n, ok, _ := parseFileNum(e.Name); ok {
+			if n > max {
+				max = n
+			}
+		}
+	}
+	db.manifestMu.Lock()
+	db.nextFileNum = max
+	db.manifestMu.Unlock()
+	return nil
 }

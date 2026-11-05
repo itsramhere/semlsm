@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"semlsm/internal/base"
@@ -337,6 +336,3 @@ func (db *DB) wakeFlush() {
 	default:
 	}
 }
-
-var _ = memtable.New
-var _ = sync.Mutex{}

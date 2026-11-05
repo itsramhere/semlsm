@@ -442,3 +442,14 @@ func (r *Reader) Close() error {
 	}
 	return nil
 }
+
+// Name returns the file name for a table number.
+func Name(num uint64) string {
+	return fmt.Sprintf("%06d.sst", num)
+}
+
+// Path returns the file path this writer writes to.
+func (w *Writer) Path() string { return w.path }
+
+// Props returns the writer's accumulated props.
+func (w *Writer) Props() Props { return w.props }

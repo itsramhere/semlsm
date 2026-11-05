@@ -9,9 +9,10 @@ import (
 // MkdirAll, List, Stat, SyncDir, Lock, and on files: Write, Sync, Truncate.
 type FaultFS struct {
 	FS
-	mu     sync.Mutex
-	counts map[string]int
-	faults map[string][]faultSpec
+	mu             sync.Mutex
+	counts         map[string]int
+	faults         map[string][]faultSpec
+	createSuffixes []createFault
 }
 
 type faultSpec struct {
@@ -72,6 +73,9 @@ func (f *FaultFS) hit(op string) error {
 
 // Create implements FS.
 func (f *FaultFS) Create(name string) (File, error) {
+	if err := f.hitCreateSuffix(name); err != nil {
+		return nil, err
+	}
 	if err := f.hit("Create"); err != nil {
 		return nil, err
 	}
@@ -190,3 +194,27 @@ func (ff *faultFile) Truncate(size int64) error {
 }
 
 var _ FS = (*FaultFS)(nil)
+
+// InjectCreateOn fails Create calls whose path ends with suffix.
+// It composes with the nth-occurrence faults for "Create".
+func (f *FaultFS) InjectCreateOn(suffix string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createSuffixes = append(f.createSuffixes, createFault{suffix: suffix, err: err})
+}
+
+type createFault struct {
+	suffix string
+	err    error
+}
+
+func (f *FaultFS) hitCreateSuffix(name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, cf := range f.createSuffixes {
+		if len(name) >= len(cf.suffix) && name[len(name)-len(cf.suffix):] == cf.suffix {
+			return cf.err
+		}
+	}
+	return nil
+}

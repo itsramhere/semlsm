@@ -1,6 +1,8 @@
 package semlsm
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -483,4 +485,175 @@ func modelSample(m *testmodel.Model) []base.Record {
 		}
 	}
 	return out
+}
+
+// M-013 item 1: file numbers must never be reused across sessions.
+func TestMultiSessionReopenFlushed(t *testing.T) {
+	fs := vfs.NewMemFS()
+	dir := "db"
+	value := make([]byte, 2048)
+	for i := range value {
+		value[i] = byte(i % 251)
+	}
+	var expect []string
+	for session := 0; session < 4; session++ {
+		db, err := Open(dir, testOptions(fs, base.RealClock{}))
+		if err != nil {
+			t.Fatalf("session %d: open: %v", session, err)
+		}
+		start := session * 200
+		for i := 0; i < 200; i++ {
+			k := fmt.Sprintf("k%04d", start+i)
+			if _, err := db.Put([]byte(k), value); err != nil {
+				t.Fatalf("session %d: put: %v", session, err)
+			}
+			expect = append(expect, k)
+		}
+		if err := db.WaitIdle(context.Background()); err != nil {
+			t.Fatalf("session %d: waitidle: %v", session, err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("session %d: close: %v", session, err)
+		}
+	}
+	// final session: every key must be Exact
+	db, err := Open(dir, testOptions(fs, base.RealClock{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, k := range expect {
+		res, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("get %q: %v", k, err)
+		}
+		if res.Kind != ResultExact || len(res.Value) != 2048 {
+			t.Fatalf("key %q lost after sessions: %+v", k, res)
+		}
+	}
+}
+
+func TestMultiSessionCrashClone(t *testing.T) {
+	fs := vfs.NewMemFS()
+	dir := "db"
+	value := make([]byte, 2048)
+	current := fs
+	var expect []string
+	for session := 0; session < 4; session++ {
+		db, err := Open(dir, testOptions(current, base.RealClock{}))
+		if err != nil {
+			t.Fatalf("session %d: open: %v", session, err)
+		}
+		start := session * 200
+		for i := 0; i < 200; i++ {
+			k := fmt.Sprintf("k%04d", start+i)
+			if _, err := db.Put([]byte(k), value); err != nil {
+				t.Fatalf("session %d: put: %v", session, err)
+			}
+			expect = append(expect, k)
+		}
+		if err := db.WaitIdle(context.Background()); err != nil {
+			t.Fatalf("session %d: waitidle: %v", session, err)
+		}
+		// crash instead of Close
+		current = current.CrashClone(vfs.DropUnsynced, nil)
+		_ = db.Close() // the clone has the state; close is irrelevant
+	}
+	db, err := Open(dir, testOptions(current, base.RealClock{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, k := range expect {
+		res, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("get %q: %v", k, err)
+		}
+		if res.Kind != ResultExact || len(res.Value) != 2048 {
+			t.Fatalf("key %q lost across crash sessions: %+v", k, res)
+		}
+	}
+}
+
+// createTrackingFS records whether any Create targeted an existing name.
+type createTrackingFS struct {
+	vfs.FS
+	mu      sync.Mutex
+	created map[string]bool
+}
+
+func (f *createTrackingFS) Create(name string) (vfs.File, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, err := f.FS.Stat(name); err == nil {
+		return nil, fmt.Errorf("create targeted existing file %q", name)
+	}
+	if f.created == nil {
+		f.created = map[string]bool{}
+	}
+	f.created[name] = true
+	return f.FS.Create(name)
+}
+
+func TestNoFileNumberReuse(t *testing.T) {
+	inner := vfs.NewMemFS()
+	track := &createTrackingFS{FS: inner}
+	dir := "db"
+	db, err := Open(dir, testOptions(track, base.RealClock{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 500; i++ {
+		if _, err := db.Put([]byte(fmt.Sprintf("k%04d", i)), make([]byte, 300)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.WaitIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// reopen to exercise recovery paths too
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db2, err := Open(dir, testOptions(track, base.RealClock{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 500; i++ {
+		if _, err := db2.Put([]byte(fmt.Sprintf("j%04d", i)), make([]byte, 300)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db2.WaitIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// M-013 item 2: a persistent flush error must back off, not hot-loop.
+func TestFlushBackoffOnPersistentError(t *testing.T) {
+	inner := vfs.NewMemFS()
+	ff := vfs.NewFaultFS(inner)
+	// fail every SST create after the first 2 (initial DB files pass)
+	ff.InjectCreateOn(".sst", errors.New("disk full")) // fail every SST create
+	db, err := Open("db", testOptions(ff, base.RealClock{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// force a rotation so a flush with an SST create is attempted
+	for i := 0; i < 400; i++ {
+		if _, err := db.Put([]byte(fmt.Sprintf("k%04d", i)), make([]byte, 500)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(1200 * time.Millisecond) // observe the attempt rate
+	creates := ff.Count("Create")
+	if creates > 60 { // backoff caps ~10-12 attempts per second; hot loop would be 1000+
+		t.Fatalf("flush retry hot loop: %d create attempts in ~1.2s", creates)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close on failed flusher: %v", err)
+	}
 }
