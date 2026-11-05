@@ -1,0 +1,12 @@
+.agent/logs/
+.agent/supervision/
+shared-memory.json
+.mcp.json
+.zcode/
+.claude/
+.env
+*.test
+*.exe
+*.prof
+/tmp/
+bench-results/
