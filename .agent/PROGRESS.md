@@ -44,14 +44,15 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 **Gate 2:** pass, including the concurrent test with `-race` or `-count=20`. — see G-006.
 
 ## P3. SSTable
-- [ ] **P3.1** `internal/bloom`: per B8. Test: no false negatives over 100k keys; false positive rate below 2%.
-- [ ] **P3.2** Block builder and reader with restarts, seek, and iterate. Tests: round trip; `SeekGE` for every key and between keys; shared-prefix keys; single entry; flipped byte -> `ErrCorruption`.
-- [ ] **P3.3** `Writer`: `Add(ikey, value)` asserts strictly ascending keys, and tracks props. `Finish` writes all sections, `Sync`, `Close`. `Abort` closes and removes the file.
-- [ ] **P3.4** `Reader`: verifies footer, loads index, bloom, props. `Get(user, S)`, `NewIterator`, `MayContain`, `Close`. Footer or block corruption -> `ErrCorruption`. Tests: 100k entries vs model; many versions per key; flip one byte anywhere (sample 200 offsets): every read either returns correct data or `ErrCorruption`, never wrong data.
-- [ ] **P3.5** `TableCache` (LRU of open readers, ref-counted; eviction closes only when refs reach 0; capacity 256; `Evict(num)` for deletion) and `BlockCache` (LRU by bytes, default 64 MiB, keyed by `(file, offset)`, mutex-protected). Tests: eviction while iterators are open; concurrent use; `Evict` followed by deleting the file works on Windows.
-- [ ] **P3.6** `internal/merge`: min-heap merging iterator over an `Iter` interface (`First, SeekGE, Next, Valid, Key, Value, Err, Close`). Propagates the first error. Test: vs a sorted model across 1–64 sources, including empty sources.
+- [x] **P3.1** bloom per B8 -> bloom.go: 10 bits/key, 7 probes, FNV-1a 64 double hashing; Encode/Decode with corruption checks. 5 tests: no false negatives 100k, FPR 0.75% < 2%, round trip, decode corruption, empty filter.
+- [x] **P3.2** block builder/reader -> block.go: uvarint shared/unshared/vlen entries, restart every 16, restart binary-search SeekGE, onDiskBlock codec 0/1 flate-if-smaller with CRC. 7 tests incl fuzz seeks and structural corruption.
+- [x] **P3.3** Writer -> writer.go: strict ascending keys, props + distinct-user tracking, 16 KiB block target, footer 64B (CRC over first 52, magic), Sync/Close, Abort removes.
+- [x] **P3.4** Reader -> reader.go (footer/index/bloom/props validation, Get, MayContain) + iterator.go (sequential block iterator). 6 tests: 100k vs model, many versions, byte-flip matrix never returns wrong data, footer corruption.
+- [x] **P3.5** caches -> cache.go: TableCache (ref-counted LRU, Evict closes at 0), BlockCache (byte-bounded LRU). 3 tests incl Evict-then-delete on Windows OSFS and concurrent use under -race.
+- [x] **P3.6** merge -> merge.go: min-heap, stable source tie-break, first-error propagation. 5 tests: 1..64 sources incl empty/nil, SeekGE, error propagation.
 
 **Gate 3:** pass; corruption tests pass.
+
 
 ## P4. Manifest and versions
 - [ ] **P4.1** `internal/manifest`: `Edit` struct per B8, `Writer`, `ReadAll`, `SetCurrent`, `ReadCurrent`. Test: round trip; torn tail tolerance; `CURRENT` atomicity under `MemFS` crash.

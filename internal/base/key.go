@@ -114,3 +114,8 @@ func Compare(a, b []byte) int {
 func SeekKey(user []byte, ts uint64) []byte {
 	return MakeInternalKey(user, ts, 0xFF)
 }
+
+// CompareUser orders two user keys by plain byte comparison.
+func CompareUser(a, b []byte) int {
+	return bytes.Compare(a, b)
+}
