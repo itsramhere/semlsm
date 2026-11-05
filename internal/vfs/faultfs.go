@@ -11,33 +11,41 @@ type FaultFS struct {
 	FS
 	mu     sync.Mutex
 	counts map[string]int
-	faults map[string]faultSpec
+	faults map[string][]faultSpec
 }
 
 type faultSpec struct {
-	nth int
-	err error
+	from, to int // occurrence range, inclusive
+	err      error
 }
 
 // NewFaultFS wraps fs.
 func NewFaultFS(fs FS) *FaultFS {
-	return &FaultFS{FS: fs, counts: map[string]int{}, faults: map[string]faultSpec{}}
+	return &FaultFS{FS: fs, counts: map[string]int{}, faults: map[string][]faultSpec{}}
 }
 
 // Inject causes the nth occurrence of op (1-based) to return err.
-// Replaces any prior fault for the same op.
+// Replaces any prior faults for the same op.
 func (f *FaultFS) Inject(op string, nth int, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.faults[op] = faultSpec{nth: nth, err: err}
+	f.faults[op] = []faultSpec{{from: nth, to: nth, err: err}}
 }
 
-// Clear removes the fault for op (all ops if op is empty).
+// InjectRange adds faults for every occurrence of op in [from, to] (1-based),
+// keeping existing specs for the op. Used for retry tests.
+func (f *FaultFS) InjectRange(op string, from, to int, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.faults[op] = append(f.faults[op], faultSpec{from: from, to: to, err: err})
+}
+
+// Clear removes the faults for op (all ops if op is empty).
 func (f *FaultFS) Clear(op string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if op == "" {
-		f.faults = map[string]faultSpec{}
+		f.faults = map[string][]faultSpec{}
 		return
 	}
 	delete(f.faults, op)
@@ -54,8 +62,10 @@ func (f *FaultFS) hit(op string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.counts[op]++
-	if spec, ok := f.faults[op]; ok && spec.nth == f.counts[op] {
-		return spec.err
+	for _, spec := range f.faults[op] {
+		if f.counts[op] >= spec.from && f.counts[op] <= spec.to {
+			return spec.err
+		}
 	}
 	return nil
 }

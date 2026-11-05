@@ -55,11 +55,12 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 
 
 ## P4. Manifest and versions
-- [ ] **P4.1** `internal/manifest`: `Edit` struct per B8, `Writer`, `ReadAll`, `SetCurrent`, `ReadCurrent`. Test: round trip; torn tail tolerance; `CURRENT` atomicity under `MemFS` crash.
-- [ ] **P4.2** `internal/version`: `FileMeta`, immutable `Version{Levels [NumLevels][]*FileMeta; Ckpts *checkpoint index snapshot}`, `Ref/Unref`. `VersionSet.Apply(edit)` returns a new Version. For L1+, keep files sorted by smallest key and check for no overlap on apply (return an error on violation). L0 sorted by file number. Files track a live-reference count across Versions. On last unref, enqueue the file to the obsolete list. For checkpoint data this phase only stores opaque tuple directory entries; P7 adds reading. Tests: apply sequence; overlap rejected; an old Version keeps files alive until unref; the obsolete list is correct.
-- [ ] **P4.3** Obsolete file deleter: runs in the background; `TableCache.Evict`, then delete with up to 5 retries at growing delays, leaving a failure for startup cleanup. Test with `FaultFS`.
+- [x] **P4.1** manifest -> manifest.go: Edit (JSON per B8, []byte keys base64), Writer (wal.Frame shared), ReadAll (wal.Replay last-mode; JSON decode errors are ErrCorruption), SetCurrent/ReadCurrent (tmp+sync+rename+syncdir), ManifestName/ParseManifestNum. 5 tests: round trip, torn tail tolerance, valid-CRC bad-JSON corruption, CURRENT atomicity (crash before/after SyncDir), name parsing.
+- [x] **P4.2** version -> version.go: FileMeta (manifest.FileMeta + atomic refs), immutable Version (Levels + CkptIndex clone-on-write), VersionSet.Apply (L0 num-desc, L1+ smallest-sorted with overlap rejection), membership-ref accounting: old versions release file refs only at death; obsolete list on zero. 7 tests: apply sequence, overlap/boundary rejection, refcount + obsolete timing, instance sharing.
+- [x] **P4.3** obsolete deleter -> obsolete.go: background worker, TableCache.Evict then Remove with 5 retries (base delay injectable), failures to Failed() for startup cleanup; FaultFS InjectRange added for retry tests. 3 tests incl. retry-then-success and fail-after-5.
 
 **Gate 4:** pass.
+
 
 ## P5. Database core (no compaction yet)
 - [ ] **P5.1** `options.go`: full Options struct per plan section P5.1 (FS, Clock, SyncMode, memtable/level/file sizes, GroupDepth/GroupDelimiter, Policies, Summarizer, semantic knobs, archive, caches, DisableAutoCompaction, Logger). `withDefaults` and `validate`. Write and check `OPTIONS.json` (group settings only; others may change).
