@@ -47,6 +47,7 @@ func (db *DB) fastCompactLoop() {
 		if db.closed.Load() {
 			return
 		}
+		db.drainObsolete()
 		plan := db.pickFast()
 		if plan == nil {
 			select {
@@ -71,6 +72,7 @@ func (db *DB) deepRawLoop() {
 		if db.closed.Load() {
 			return
 		}
+		db.drainObsolete()
 		plan := db.pickDeepRaw()
 		if plan == nil {
 			select {
@@ -279,6 +281,7 @@ func (db *DB) WaitIdle(ctx context.Context) error {
 		if idle {
 			return nil
 		}
+		db.drainObsolete()
 		time.Sleep(2 * time.Millisecond)
 	}
 }
@@ -311,3 +314,25 @@ var (
 	_ = sstable.OpenReader
 	_ = base.NumLevels
 )
+
+// drainObsolete moves files whose versions died into the deleter queue.
+// Files die only when their last referencing Version unrefs, so a snapshot
+// keeps them alive (P6.4, M-014 item 4).
+func (db *DB) drainObsolete() {
+	if db.obsolete == nil {
+		return
+	}
+	for _, d := range db.vs.TakeObsolete() {
+		suffix := ".sst"
+		isCkpt := false
+		if d.Level < 0 {
+			suffix = ".ckpt"
+			isCkpt = true
+		}
+		db.obsolete.Enqueue(version.ObsoleteFile{
+			Path:   filepath.Join(db.dir, fmt.Sprintf("%06d%s", d.Num, suffix)),
+			Num:    d.Num,
+			IsCkpt: isCkpt,
+		})
+	}
+}

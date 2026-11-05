@@ -189,6 +189,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		logger:    opts.Logger,
 	}
 	db.stallCond = sync.NewCond(&db.mu)
+	db.busy = map[uint64]bool{}
 	if err := db.openRecover(); err != nil {
 		lockH.Unlock()
 		return nil, err

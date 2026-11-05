@@ -126,11 +126,11 @@ func (p *Picker) planL0(v *version.Version, busy map[uint64]bool) *Plan {
 	}
 	lo := base.UserKey(inputs[len(inputs)-1].Smallest) // L0 sorted num-desc: last is smallest
 	hi := base.UserKey(inputs[0].Largest)
-	overlaps := overlapRange(v.Levels[1], lo, hi, busy)
-	if overlaps == nil {
+	ovs, ok := overlapRange(v.Levels[1], lo, hi, busy)
+	if !ok {
 		return nil
 	}
-	return &Plan{Level: 0, OutputLevel: 1, Inputs: inputs, Overlaps: overlaps}
+	return &Plan{Level: 0, OutputLevel: 1, Inputs: inputs, Overlaps: ovs}
 }
 
 // planLevel picks one input file by round-robin cursor plus the overlapping
@@ -154,18 +154,18 @@ func (p *Picker) planLevel(v *version.Version, level int, busy map[uint64]bool) 
 	}
 	p.cursors[level]++ // advance round-robin regardless of which file won
 
-	overlaps := overlapRange(v.Levels[level+1],
+	ovs, ok := overlapRange(v.Levels[level+1],
 		base.UserKey(input.Smallest), base.UserKey(input.Largest), busy)
-	if overlaps == nil {
+	if !ok {
 		return nil
 	}
 	return &Plan{Level: level, OutputLevel: level + 1,
-		Inputs: []*version.FileMeta{input}, Overlaps: overlaps}
+		Inputs: []*version.FileMeta{input}, Overlaps: ovs}
 }
 
-// overlapRange returns the files whose user-key range intersects [lo, hi],
-// or nil if any of them is busy.
-func overlapRange(files []*version.FileMeta, lo, hi []byte, busy map[uint64]bool) []*version.FileMeta {
+// overlapRange returns the files whose user-key range intersects [lo, hi].
+// ok is false when any of them is busy (the plan must be abandoned).
+func overlapRange(files []*version.FileMeta, lo, hi []byte, busy map[uint64]bool) (ovs []*version.FileMeta, ok bool) {
 	var out []*version.FileMeta
 	for _, f := range files {
 		fLo := base.UserKey(f.Smallest)
@@ -174,11 +174,11 @@ func overlapRange(files []*version.FileMeta, lo, hi []byte, busy map[uint64]bool
 			continue
 		}
 		if busy[f.Num] {
-			return nil
+			return nil, false
 		}
 		out = append(out, f)
 	}
-	return out
+	return out, true
 }
 
 // OutputWriter writes compaction outputs, cutting files at TargetFileBytes

@@ -216,3 +216,19 @@ func (m *Model) Keys() [][]byte {
 	sort.Slice(out, func(i, j int) bool { return base.CompareUser(out[i], out[j]) < 0 })
 	return out
 }
+
+// AllVersions returns every recorded version sorted by (key asc, ts asc).
+// Used by checkLSM to verify structural compaction retains everything.
+func (m *Model) AllVersions() []base.Record {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]base.Record, len(m.recs))
+	copy(out, m.recs)
+	sort.Slice(out, func(i, j int) bool {
+		if base.CompareUser(out[i].Key, out[j].Key) != 0 {
+			return base.CompareUser(out[i].Key, out[j].Key) < 0
+		}
+		return out[i].Ts < out[j].Ts
+	})
+	return out
+}
