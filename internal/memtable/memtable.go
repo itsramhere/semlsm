@@ -174,3 +174,25 @@ func (it *Iterator) Key() []byte { return it.cur.key }
 
 // Value returns the value of the current entry (aliased).
 func (it *Iterator) Value() []byte { return it.cur.val }
+
+// Close releases the iterator handle. Memtable iterators hold no exclusive
+// resources (nodes are immutable), so this is bookkeeping only; it exists so
+// memtable iterators compose with merge.Iter.
+func (it *Iterator) Close() error {
+	it.cur = nil
+	return nil
+}
+
+var _ interface {
+	First()
+	SeekGE(ikey []byte)
+	Next()
+	Valid() bool
+	Key() []byte
+	Value() []byte
+	Err() error
+	Close() error
+} = (*Iterator)(nil)
+
+// Err returns nil: memtable iteration cannot fail structurally.
+func (it *Iterator) Err() error { return nil }

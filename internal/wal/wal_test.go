@@ -502,3 +502,50 @@ func TestReplayStrict(t *testing.T) {
 		t.Fatalf("zero-length frame with garbage: err=%v, want ErrCorruption", err)
 	}
 }
+
+func TestReplayStrictFlippedLengthBytes(t *testing.T) {
+	// M-012 item 2: flipping a length byte of a non-final frame must yield
+	// ErrCorruption, never silent data loss.
+	p1 := encodeBatch(t, 1, []base.Record{rec("a", 1, base.KindPut, "v1")})
+	p2 := encodeBatch(t, 2, []base.Record{rec("b", 2, base.KindPut, "v2-longer")})
+	p3 := encodeBatch(t, 3, []base.Record{rec("c", 3, base.KindPut, "v3-longest")})
+	fs := writeWALFile(t, p1, p2, p3)
+	full := readAllWAL(t, fs, "wal")
+	start2 := int64(frameHeaderLen + len(p1))
+	start3 := start2 + int64(frameHeaderLen+len(p2))
+
+	corruptAt := func(off int64) *vfs.MemFS {
+		c := append([]byte(nil), full...)
+		c[off] ^= 0x01
+		cfs := vfs.NewMemFS()
+		f, _ := cfs.Create("wal")
+		f.Write(c)
+		f.Close()
+		return cfs
+	}
+	for i := 0; i < 4; i++ {
+		for _, frameStart := range []int64{0, start2} { // first and middle frame
+			cfs := corruptAt(frameStart + int64(i)) // length bytes at 0..3
+			n := 0
+			_, err := ReplayStrict(cfs, "wal", func(p []byte) error { n++; return nil })
+			if !errors.Is(err, base.ErrCorruption) {
+				t.Fatalf("length byte %d of frame at %d: err=%v n=%d, want ErrCorruption", i, frameStart, err, n)
+			}
+		}
+	}
+	// final frame TRUNCATED at every byte: torn tail, still tolerated
+	for off := start3; off < int64(len(full)); off++ {
+		trimmed := truncateCopy(t, fs, off)
+		n := 0
+		_, err := ReplayStrict(trimmed, "wal", func(p []byte) error { n++; return nil })
+		if err != nil || n != 2 {
+			t.Fatalf("final frame tear at %d: n=%d err=%v", off, n, err)
+		}
+	}
+	// a bit flip in the final frame's LAST PAYLOAD byte fails the CRC with
+	// the frame ending exactly at EOF: torn tail, tolerated
+	payloadFlip := corruptAt(int64(len(full)) - 1)
+	if _, err := ReplayStrict(payloadFlip, "wal", func(p []byte) error { return nil }); err != nil {
+		t.Fatalf("payload flip in final frame: err=%v, want torn tail", err)
+	}
+}

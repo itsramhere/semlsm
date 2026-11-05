@@ -217,3 +217,15 @@ func (bc *BlockCache) Len() int {
 	defer bc.mu.Unlock()
 	return len(bc.m)
 }
+
+// CloseAll closes every cached reader immediately (used at DB shutdown).
+func (tc *TableCache) CloseAll() {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	for num, e := range tc.m {
+		tc.lru.Remove(e.elem)
+		e.removed = true
+		delete(tc.m, num)
+		tc.closeEntry(e)
+	}
+}

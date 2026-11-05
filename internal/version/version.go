@@ -51,22 +51,27 @@ type Version struct {
 }
 
 // Ref pins the version. Panics on a dead version: reviving a released
-// Version may observe deleted files (M-011 item 4).
+// Version may observe deleted files (M-011 item 4). The Add result decides
+// liveness atomically (M-012 item 1): n <= 1 means the version had no
+// references left.
 func (v *Version) Ref() {
-	if v.refs.Load() == 0 {
+	n := v.refs.Add(1)
+	if n <= 1 {
 		panic("version: Ref on a released version")
 	}
-	v.refs.Add(1)
 }
 
 // Unref releases the version; when the last reference drops, the files it
 // holds are dereferenced and files reaching zero are enqueued as obsolete.
-// A double Unref is a programming error and panics (M-011 item 4).
+// A double Unref is a programming error and panics (M-011 item 4). The Add
+// result is the only liveness check (M-012 item 1): a separate Load would
+// let two concurrent Unrefs both see zero and double-release files.
 func (v *Version) Unref() {
-	if v.refs.Add(-1) < 0 {
+	n := v.refs.Add(-1)
+	if n < 0 {
 		panic("version: Unref below zero")
 	}
-	if v.refs.Load() != 0 {
+	if n != 0 {
 		return
 	}
 	if v.vs != nil {
@@ -114,9 +119,9 @@ func (vs *VersionSet) Acquire() *Version {
 	return v
 }
 
-// currentLocked returns the current version without a reference.
+// currentForTest returns the current version without a reference.
 // Test-only introspection; readers must use Acquire.
-func (vs *VersionSet) currentLocked() *Version {
+func (vs *VersionSet) currentForTest() *Version {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	return vs.current

@@ -2,6 +2,7 @@ package version
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"semlsm/internal/base"
@@ -361,5 +362,38 @@ func TestVersionCountersTakeMax(t *testing.T) {
 	}
 	if vs.NextFileNum != 200 || vs.LastTs != 900 || vs.LogNum != 9 {
 		t.Fatalf("counters did not advance: %d/%d/%d", vs.NextFileNum, vs.LastTs, vs.LogNum)
+	}
+}
+
+// M-012 item 1: concurrent Unrefs must release exactly once. A file still
+// in the current version must never become obsolete.
+func TestVersionConcurrentUnrefSingleRelease(t *testing.T) {
+	const iters = 50000
+	for i := 0; i < iters; i++ {
+		vs := NewVersionSet()
+		if _, err := vs.Apply(&manifest.Edit{NextFileNum: uint64(i*10 + 2), AddFiles: []manifest.FileMeta{fm(0, uint64(i*10+1), "a", "c")}}); err != nil {
+			t.Fatal(err)
+		}
+		v := vs.Acquire()
+		v.Ref()
+		if _, err := vs.Apply(&manifest.Edit{NextFileNum: uint64(i*10 + 3), AddFiles: []manifest.FileMeta{fm(0, uint64(i*10+2), "d", "f")}}); err != nil {
+			t.Fatal(err)
+		}
+		// v now holds the only two refs (Acquire + Ref) on the old version
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for g := 0; g < 2; g++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				v.Unref()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if got := vs.TakeObsolete(); len(got) != 0 {
+			t.Fatalf("iter %d: live file marked obsolete: %+v", i, got)
+		}
 	}
 }

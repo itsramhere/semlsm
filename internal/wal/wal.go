@@ -227,7 +227,16 @@ func ReplayStrict(fs vfs.FS, path string, fn func(payload []byte) error) (validB
 				path, validBytes, base.ErrCorruption)
 		}
 		if payloadLen > MaxPayloadSize || int64(payloadLen) > remaining {
-			return validBytes, nil // declared length past EOF: torn tail
+			// The declared length is past EOF. The frame header is not CRC
+			// covered, so a flipped length byte in a non-final frame also
+			// lands here: scan forward for any offset that parses as a
+			// complete frame with a valid CRC. Found => corruption, else a
+			// real torn tail (M-012 item 2).
+			if hasValidFrameAfter(f, validBytes+1, fileSize) {
+				return validBytes, fmt.Errorf("wal: replay strict %s at offset %d: declared length past EOF but valid frame follows: %w",
+					path, validBytes, base.ErrCorruption)
+			}
+			return validBytes, nil // torn tail
 		}
 		if int64(cap(payload)) < int64(payloadLen) {
 			payload = make([]byte, payloadLen)
@@ -250,4 +259,42 @@ func ReplayStrict(fs vfs.FS, path string, fn func(payload []byte) error) (validB
 		}
 		validBytes += frameHeaderLen + int64(payloadLen)
 	}
+}
+
+// hasValidFrameAfter scans the tail from `from` for any offset that parses
+// as a complete frame with a non-zero in-bounds length and a valid CRC.
+// Used by ReplayStrict to distinguish a real torn tail from a corrupted
+// length field hiding live frames.
+func hasValidFrameAfter(f vfs.File, from int64, fileSize int64) bool {
+	if from >= fileSize {
+		return false
+	}
+	tail := make([]byte, fileSize-from)
+	if _, err := f.ReadAt(tail, from); err != nil && err != io.EOF {
+		return false
+	}
+	for off := 0; off+frameHeaderLen <= len(tail); off++ {
+		pl := binary.LittleEndian.Uint32(tail[off : off+4])
+		wantCRC := binary.LittleEndian.Uint32(tail[off+4 : off+8])
+		if pl == 0 || pl > MaxPayloadSize {
+			continue
+		}
+		if off+frameHeaderLen+int(pl) > len(tail) {
+			continue
+		}
+		payload := tail[off+frameHeaderLen : off+frameHeaderLen+int(pl)]
+		if base.CRC(payload) == wantCRC {
+			return true
+		}
+	}
+	return false
+}
+
+// AppendFrame writes a pre-built frame (from Frame) and accounts its size.
+func (w *Writer) AppendFrame(frame []byte) error {
+	if _, err := w.f.Write(frame); err != nil {
+		return fmt.Errorf("wal: append %s: %w", w.path, err)
+	}
+	w.size += int64(len(frame))
+	return nil
 }
