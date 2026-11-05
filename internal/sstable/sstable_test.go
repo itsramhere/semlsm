@@ -686,3 +686,46 @@ func TestReaderCacheWiring(t *testing.T) {
 		}
 	}
 }
+
+// M-009 item 1: per-Get release idempotence with concurrent holders.
+func TestTableCacheTwoHoldersRelease(t *testing.T) {
+	fs := vfs.NewMemFS()
+	var entries []sstEntry
+	entries = append(entries, sstEntry{base.MakeInternalKey([]byte("k"), 1, base.KindPut), []byte("v")})
+	buildTable(t, fs, "000001.sst", entries)
+
+	tc := NewTableCache(4, func(num uint64) (*Reader, error) {
+		return OpenReader(fs, fmt.Sprintf("%06d.sst", num))
+	})
+
+	// (a) Get, Get, release, release, Evict -> 0 handles.
+	ra, rela, _ := tc.Get(1)
+	rb, relb, _ := tc.Get(1)
+	if ra != rb {
+		t.Fatal("same entry expected")
+	}
+	rela()
+	relb() // second holder's release must still decrement
+	tc.Evict(1)
+	if n := fs.OpenHandles(); n != 0 {
+		t.Fatalf("(a) %d handles left, want 0", n)
+	}
+
+	// (b) Get A, Get B (same entry), release A twice, Evict: reader still
+	// works, after release B handles are 0.
+	_, relA, _ := tc.Get(1)
+	rB, relB, _ := tc.Get(1)
+	relA()
+	relA() // idempotent
+	if _, _, _, ok, err := rB.Get([]byte("k"), 1); err != nil || !ok {
+		t.Fatalf("(b) reader B broken after A releases: ok=%v err=%v", ok, err)
+	}
+	tc.Evict(1) // B still referenced: stays open
+	if n := fs.OpenHandles(); n != 1 {
+		t.Fatalf("(b) expected 1 handle while B holds a ref, got %d", n)
+	}
+	relB()
+	if n := fs.OpenHandles(); n != 0 {
+		t.Fatalf("(b) %d handles left after B release, want 0", n)
+	}
+}

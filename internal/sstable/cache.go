@@ -17,12 +17,11 @@ type TableCache struct {
 }
 
 type tableEntry struct {
-	num      uint64
-	r        *Reader
-	refs     int
-	elem     *list.Element
-	removed  bool // evicted via Evict or capacity; close on last release
-	released bool // release idempotence
+	num     uint64
+	r       *Reader
+	refs    int
+	elem    *list.Element
+	removed bool // evicted via Evict or capacity; close on last release
 }
 
 // NewTableCache builds a cache with the given capacity and opener.
@@ -61,15 +60,18 @@ func (tc *TableCache) Get(num uint64) (r *Reader, release func(), err error) {
 
 // releaseFunc captures the entry itself (M-008 item 1): a release after the
 // entry was evicted must still reach it, and must not touch a newer entry
-// registered under the same file number.
+// registered under the same file number. Idempotence is per closure
+// (M-009 item 1): each Get's release decrements exactly once, so concurrent
+// holders release independently.
 func (tc *TableCache) releaseFunc(e *tableEntry) func() {
+	done := false
 	return func() {
 		tc.mu.Lock()
 		defer tc.mu.Unlock()
-		if e.released {
-			return // idempotent
+		if done {
+			return
 		}
-		e.released = true
+		done = true
 		e.refs--
 		if e.refs == 0 && e.removed {
 			tc.closeEntry(e)

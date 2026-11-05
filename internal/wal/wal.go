@@ -41,16 +41,10 @@ func NewWriter(fs vfs.FS, path string) (*Writer, error) {
 // An empty payload is rejected: a zero-length frame is indistinguishable from
 // a zero-filled crash tail and would break replay (M-006 item 2).
 func (w *Writer) Append(payload []byte) error {
-	if len(payload) == 0 {
-		return fmt.Errorf("wal: append %s: empty payload", w.path)
+	frame, err := Frame(payload)
+	if err != nil {
+		return fmt.Errorf("wal: append %s: %w", w.path, err)
 	}
-	if len(payload) > MaxPayloadSize {
-		return fmt.Errorf("wal: append %s: %w (%d bytes)", w.path, ErrFrameTooLarge, len(payload))
-	}
-	frame := make([]byte, frameHeaderLen+len(payload))
-	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(frame[4:8], base.CRC(payload))
-	copy(frame[frameHeaderLen:], payload)
 	if _, err := w.f.Write(frame); err != nil {
 		return fmt.Errorf("wal: append %s: %w", w.path, err)
 	}
@@ -154,11 +148,19 @@ func Replay(fs vfs.FS, path string, last bool, fn func(payload []byte) error) (v
 }
 
 // Frame builds one on-disk frame (header + payload) without writing it.
-// Used by the manifest, whose frames share the WAL format.
-func Frame(payload []byte) []byte {
+// Used by the manifest, whose frames share the WAL format. The payload must
+// be non-empty and within MaxPayloadSize (M-009 item 3): a zero-length frame
+// is indistinguishable from a zero-filled crash tail and breaks replay.
+func Frame(payload []byte) ([]byte, error) {
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("wal: frame: empty payload")
+	}
+	if len(payload) > MaxPayloadSize {
+		return nil, fmt.Errorf("wal: frame: %w (%d bytes)", ErrFrameTooLarge, len(payload))
+	}
 	frame := make([]byte, frameHeaderLen+len(payload))
 	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(frame[4:8], base.CRC(payload))
 	copy(frame[frameHeaderLen:], payload)
-	return frame
+	return frame, nil
 }

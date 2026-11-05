@@ -93,8 +93,8 @@ func (b *Bloom) Encode() []byte {
 // Decode parses an encoded filter. Corruption returns an error wrapping
 // base.ErrCorruption.
 func Decode(payload []byte) (*Bloom, error) {
-	if len(payload) < 1 {
-		return nil, fmt.Errorf("bloom: decode: empty: %w", base.ErrCorruption)
+	if len(payload) < 2 {
+		return nil, fmt.Errorf("bloom: decode: payload too short: %w", base.ErrCorruption)
 	}
 	k := payload[len(payload)-1]
 	if k == 0 {
