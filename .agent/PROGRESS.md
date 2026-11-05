@@ -25,7 +25,15 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 - [x] **P1.4** `internal/failpoint`
   -> Hit/Set/SetError/Reset/List, RWMutex-guarded, near-zero cost when unset. 3 tests.
 
-**Gate 1:** all pass, `gofmt`, `vet`. — see G-003.
+**Gate 1:** all pass, `gofmt`, `vet`. — see G-003; CHANGES verdict M-004 fixed in commit 935ef6c7:
+  1 Remove now hides the file from Open/Stat/List immediately (graveyard only affects CrashClone).
+  2 Write honors and advances the per-handle offset (overwrite in place, then extend).
+  3 Graveyard is a slice of displaced states; durable entries are never overwritten; crash tests for remove/create/remove and double-rename sequences.
+  4 Close returns os.ErrClosed after close (all methods); MemFS.OpenHandles() added.
+  5 memState tracks the current name; Stat/handle-Stat use it.
+  6 failpoint.Define permanent registry; List returns defined names; Reset keeps definitions.
+  7 Hit short-circuits on an atomic counter of armed hooks.
+  8 TestFSContract runs one scenario against OSFS and MemFS (M-004 item 8).
 
 ## P2. WAL and memtable
 - [ ] **P2.1** `internal/wal`: `Writer{Append(payload), Sync, Close, Size}`; `Replay(file, last bool, fn) (validBytes int64, err)`. Encode and decode batch payload. Tests: round trip; torn at every byte offset of the final frame (loop over all prefixes): the last-WAL mode returns all earlier frames and no error; flipped byte: `ErrCorruption` in non-last mode; a max-size frame; an oversized length field doesn't allocate huge memory (check against the remaining file size before allocating).
