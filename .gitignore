@@ -10,3 +10,6 @@ shared-memory.json
 *.prof
 /tmp/
 bench-results/
+docs/
+SEMLSM_IMPLEMENTATION_PLAN.md
+.agent/

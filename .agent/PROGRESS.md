@@ -4,20 +4,28 @@ Source of truth for task state. `[ ]` unchecked, `[x]` done (append one line: wh
 Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate; gates tag `phase-N-done`.
 
 ## P0. Bootstrap
-- [ ] **P0.1** Run `go version` (need >= 1.22; if it's older, use its features only, set `go.mod` accordingly, and log it). Record OS, Go version, cgo, gcc, race availability, and whether `SEMLSM_LLM_API_KEY` is set (yes or no only, never the value) in `.agent/ENV.md`.
-- [ ] **P0.2** `git init` if needed, plus `git config user.name "semlsm-agent"` and `git config user.email "agent@localhost"` (local to the repo only). `.gitattributes`: `* text=auto eol=lf`. `.gitignore`: `.agent/logs/`, `.agent/supervision/`, `shared-memory.json`, `.mcp.json`, `.zcode/`, `.claude/`, `.env`, `*.test`, `*.exe`, `*.prof`, `/tmp/`, `bench-results/`.
-- [ ] **P0.3** `go mod init semlsm`. Create the directory tree and `.agent/` files, without touching `.agent/supervision/TO_GLM.md`. Copy every checkbox task in this plan into `PROGRESS.md`. Append the `START` message to `FROM_GLM.md`, and create the `semlsm-status` entity in `shared-memory`.
-- [ ] **P0.4** `scripts/verify.ps1` runs A5's commands with exit-code checks, with the race step gated on `.agent/ENV.md`. Add a trivial test.
+- [x] **P0.1** Run `go version` (need >= 1.22; if it's older, use its features only, set `go.mod` accordingly, and log it). Record OS, Go version, cgo, gcc, race availability, and whether `SEMLSM_LLM_API_KEY` is set (yes or no only, never the value) in `.agent/ENV.md`.
+  -> ENV.md written. go1.26.3, cgo=1, gcc 14.2.0; race probe passed; key not set.
+- [x] **P0.2** `git init` if needed, plus `git config user.name "semlsm-agent"` and `git config user.email "agent@localhost"` (local to the repo only). `.gitattributes`: `* text=auto eol=lf`. `.gitignore`: `.agent/logs/`, `.agent/supervision/`, `shared-memory.json`, `.mcp.json`, `.zcode/`, `.claude/`, `.env`, `*.test`, `*.exe`, `*.prof`, `/tmp/`, `bench-results/`.
+  -> repo on branch main, local identity, both files written.
+- [x] **P0.3** `go mod init semlsm`. Create the directory tree and `.agent/` files, without touching `.agent/supervision/TO_GLM.md`. Copy every checkbox task in this plan into `PROGRESS.md`. Append the `START` message to `FROM_GLM.md`, and create the `semlsm-status` entity in `shared-memory`.
+  -> module semlsm; tree + .agent files created; PROGRESS.md has all tasks; G-001 START appended; entity created.
+- [x] **P0.4** `scripts/verify.ps1` runs A5's commands with exit-code checks, with the race step gated on `.agent/ENV.md`. Add a trivial test.
+  -> verify.ps1 (race gated on ENV.md); bootstrap_test.go; go test + -race probe pass; gofmt/vet clean.
 
-**Gate 0:** `go test ./...` passes; first commit exists.
+**Gate 0:** `go test ./...` passes; first commit exists. — PASSED, commit 69c77b3, tag phase-0-done.
 
 ## P1. Base and VFS
-- [ ] **P1.1** `internal/base`: `Kind`, `MakeInternalKey`, `SplitInternalKey`, `Compare`, `SeekKey(user, ts)`, `GroupOf`, `Clock` interface with `RealClock` and `ManualClock`, errors, `CRC`, `SourceCRC`, `Record{Key, Ts, Kind, Value}`. Tests: ordering table (same key different ts, prefix keys `a` vs `ab`, keys containing `0x00`), round trips, `GroupOf` table including the examples in B4.
-- [ ] **P1.2** `internal/vfs`: `FS` interface: `Create, Open, OpenReadWrite, Rename, Remove, MkdirAll, List, Stat, SyncDir, Lock`. `File`: `Read, ReadAt, Write, Sync, Close, Truncate, Stat`. `OSFS`: `SyncDir` real on Unix, no-op on Windows (`syncdir_windows.go`, `syncdir_unix.go`, with `//go:build`). `Lock`: Unix `syscall.Flock`; Windows `syscall.CreateFile` with share mode 0, keeping the handle open. The OS releases both on process death.
-- [ ] **P1.3** `MemFS` for crash simulation: tracks synced vs unsynced length per file and durable vs pending renames and directory entries. `CrashClone(mode)` returns the post-crash FS: `DropUnsynced` keeps only synced data, and `TornTail(rng)` keeps a random prefix of unsynced bytes. Also a `FaultFS` wrapper injecting errors on the Nth matching operation. Tests: unsynced data is lost, synced survives, rename without `SyncDir` can revert, injected errors surface.
-- [ ] **P1.4** `internal/failpoint`: `Hit(name) error`, `Set(name, fn)`, `Reset()`. Compiled always, near zero cost when unset (an atomic counter check). Test it.
+- [x] **P1.1** `internal/base`: ... (full text in plan)
+  -> key.go (Kind/Record/MakeInternalKey/SplitInternalKey/UserKey/Compare/SeekKey), errors.go (sentinels, size limits, NumLevels=5, ValidateKV), clock.go (Clock/RealClock/ManualClock), crc.go (CRC-32C, SourceCRC order-independent), group.go (GroupOf). 11 tests pass: ordering table, transitivity, round trips, GroupOf B4 examples, CRC known-vector, SourceCRC field coverage.
+- [x] **P1.2** `internal/vfs` OSFS + interfaces
+  -> vfs.go (FS/File/LockHandle/FileInfo), os.go (OSFS), syncdir_windows.go (no-op) + syncdir_unix.go (dir fsync) with build tags, lock_windows.go (CreateFile share mode 0) + lock_unix.go (flock LOCK_EX|LOCK_NB).
+- [x] **P1.3** MemFS crash sim + FaultFS
+  -> memfs.go: synced-vs-unsynced bytes, durable dirs, rename/remove revert until SyncDir, CrashClone(DropUnsynced|TornTail(rng)); faultfs.go: nth-occurrence injection on FS ops and file Write/Sync/Truncate. 11 tests: unsynced lost, torn prefix, rename revert, remove durability, dir durability, read semantics, list/stat, fault surfacing, OSFS basic, lock exclusivity.
+- [x] **P1.4** `internal/failpoint`
+  -> Hit/Set/SetError/Reset/List, RWMutex-guarded, near-zero cost when unset. 3 tests.
 
-**Gate 1:** all pass, `gofmt`, `vet`.
+**Gate 1:** all pass, `gofmt`, `vet`. — see G-003.
 
 ## P2. WAL and memtable
 - [ ] **P2.1** `internal/wal`: `Writer{Append(payload), Sync, Close, Size}`; `Replay(file, last bool, fn) (validBytes int64, err)`. Encode and decode batch payload. Tests: round trip; torn at every byte offset of the final frame (loop over all prefixes): the last-WAL mode returns all earlier frames and no error; flipped byte: `ErrCorruption` in non-last mode; a max-size frame; an oversized length field doesn't allocate huge memory (check against the remaining file size before allocating).

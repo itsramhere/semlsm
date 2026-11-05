@@ -1,15 +1,16 @@
 # scripts/verify.ps1 - run the A5 verification suite with exit-code checks.
-# Usage: powershell -ExecutionPolicy Bypass -File scripts\verify.ps1 [-Race:$true|:$false] [-Full]
+# Usage: powershell -ExecutionPolicy Bypass -File scripts\verify.ps1 [-Race] [-NoRace]
 # Default race decision comes from .agent/ENV.md (race: AVAILABLE => on).
 
 param(
     [switch]$Race,
-    [switch]$NoRace,
-    [switch]$Full  # run all packages with -count=1 (gate mode); default is affected-package mode handled by caller
+    [switch]$NoRace
 )
 
-$ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
+# Native tools (go, gcc) write progress to stderr; do NOT stop on stderr lines.
+# Exit codes are checked explicitly via $LASTEXITCODE.
+$ErrorActionPreference = 'Continue'
 
 $fail = 0
 
@@ -25,37 +26,37 @@ function Run-Step {
     }
     if ($code -ne 0) {
         Write-Host "FAIL: $Name (exit $code)"
-        $tail = $out | Select-Object -Last 40
-        $tail | ForEach-Object { Write-Host $_ }
+        $out | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
         $script:fail = 1
     } else {
         Write-Host "ok: $Name"
     }
 }
 
-Run-Step 'gofmt' { gofmt -l . } 'gofmt.log'
-# gofmt -l exits 0 even when listing files; treat any output line as failure
+# gofmt -l exits 0 even when listing files: fail on any output.
 $gofmtOut = gofmt -l .
-if ($gofmtOut) { Write-Host 'FAIL: gofmt reported unformatted files:'; $gofmtOut; $script:fail = 1 }
+if ($LASTEXITCODE -ne 0 -or $gofmtOut) {
+    Write-Host 'FAIL: gofmt'
+    $gofmtOut | ForEach-Object { Write-Host $_ }
+    $script:fail = 1
+} else {
+    Write-Host 'ok: gofmt'
+}
 
 Run-Step 'go vet' { go vet ./... } 'vet.log'
-
-if ($Full) {
-    Run-Step 'go test' { go test ./... -count=1 -timeout 300s } 'test.log'
-} else {
-    Run-Step 'go test' { go test ./... -count=1 -timeout 300s } 'test.log'
-}
+Run-Step 'go test' { go test ./... -count=1 -timeout 300s } 'test.log'
 
 # race gating from .agent/ENV.md
 $raceWanted = $true
-if (-not ($Race -or $NoRace)) {
+if ($NoRace) {
+    $raceWanted = $false
+} elseif (-not $Race) {
     $envMd = Join-Path '.agent' 'ENV.md'
     if (Test-Path $envMd) {
         $content = Get-Content $envMd -Raw
         if ($content -match 'Race detector:\s*UNAVAILABLE') { $raceWanted = $false }
     }
 }
-if ($NoRace) { $raceWanted = $false }
 
 if ($raceWanted) {
     Run-Step 'go test -race' { go test ./... -race -count=1 -timeout 600s } 'test-race.log'
