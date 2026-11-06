@@ -82,13 +82,14 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 **Gate 6:** full raw LSM passes all. — PASSED, see G-021.
 
 ## P7. Checkpoint format and transparent resolution
-- [ ] **P7.1** `internal/checkpoint`: `Writer{AddTuple(meta, summary, entries)}`, `Finish`; `Reader{Tuples(), ReadMeta(id), ReadSummary(id), LookupKey(id, key) (Entry, bool), IterKeys(id)}`, per B8. Readers are cached and ref-counted, the same as SSTs. Corruption -> `ErrCorruption`. Tests: round trip at 1 and 50,000 keys; flip samples yield `ErrCorruption`; prefix-compressed lookup vs a map model.
-- [ ] **P7.2** Version integration: `CkptIndex` is an immutable `map[group][]TupleRef`, with each slice sorted by `TsFrom`. New Versions share unchanged slices. `Apply` handles `add_ckpts` and `del_ckpts`.
-- [ ] **P7.3** Entry lookup: for `(K, S)`: `refs := index[GroupOf(K)]`; for every ref with `TsFrom <= S`, check bloom then `LookupKey`, keep the entry with the largest `MinTs <= S`. Skip the checkpoint lookup entirely if the group has no tuples.
-- [ ] **P7.4** Wire `Get`, `GetAt`, and `Snapshot.Get` to `Resolve`: build `CheckpointInfo` lazily (read summary only if the outcome is `UseSummary`).
-- [ ] **P7.5** Test-only helper `installHandmadeCheckpoint(t, db, group, tsCut)`, which rewrites the relevant SSTs and installs a tuple atomically, via the same edit path. Tests: every row of the truth table end to end; the v49/v50–60/v61 example from B6; a delete as last dropped record, row 7; a snapshot taken before install reads Exact, and one after reads Summarized; `db.VerifyIntegrity` catches a flipped checkpoint byte.
+- [x] **P7.1** internal/checkpoint -> Writer (SLCK header, tuples: meta JSON+CRC, flate-if-smaller summary/index sections with codec byte in CRC, prefix-compressed key index with restarts every 32 + bloom + fixed trailer, framed JSON directory, 24B footer) + Reader (footer/dir validation, lazy per-tuple parse cache, LookupKey with restart binary search, IterKeys) + ref-counted CkptCache. 5 tests: round trip, 50k keys, single key/empty summary, byte-flip matrix, prefix compression.
+- [x] **P7.2** version CkptIndex -> ByNum + ByGroup (map[string][]TupleLoc sorted by TsFrom, rebuilt on clone/Apply). Existing version tests extended.
+- [x] **P7.3** entry lookup -> db.checkpointLookup walks group refs with TsFrom <= S, keeps the entry with the largest MinTs <= S (B6/P7.3).
+- [x] **P7.4** Get/GetAt/Snapshot.Get wired to Resolve via checkpointLookup; CheckpointInfo built lazily (summary read only on UseSummary); ref handling on every outcome path.
+- [x] **P7.5** p7_test.go -> installHandmadeCheckpoint (Flush first, rewrite SSTs without dropped records at the same level, one atomic manifest edit + install); truth-table rows end to end incl. B6's v49/v50-60/v61 example; row 7 with the run ending in a delete; snapshot-before-install reads Exact from pinned raw while live reads Summarized (I9); minimal VerifyIntegrity catches a flipped ckpt byte.
+- [x] **BUG FIX (found by the P6.4 pin test under -race)**: concurrent installs (flush worker vs CompactLevel vs handmade) each captured old = db.rs.version separately and could double-release the readState's version ref, killing a snapshot-pinned version and deleting its files. Fix: Apply->readState swap now happens under manifestMu (nested db.mu; lock order manifestMu->mu per B7) in finishFlush and runStructural, so exactly one installer releases the readState ref.
 
-**Gate 7:** pass.
+**Gate 7:** pass. — PASSED, see G-022.
 
 ## P8. Semantic pipeline with mock only
 - [ ] **P8.1** `internal/llm`: `Request`/`Response`/`Client` interface, `ErrTransient/ErrPermanent/ErrBudgetExhausted/ErrCircuitOpen`, `Summarizer` interface, `MockClient` (deterministic, parses record ids, returns valid JSON citing the first 3; modes Valid/BadJSON/FencedJSON/HallucinatedRef/TooLong/Transient(n)/Permanent/Block(ctx)/Injected; counts calls).
@@ -162,7 +163,7 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 - [x] Gate 4 (P4) — PASSED, commit 7533df9, tag phase-4-done
 - [x] Gate 5 (P5) — PASSED, commit f039828, tag phase-5-done
 - [x] Gate 6 (P6) — PASSED, commit 97b3812, tag phase-6-done
-- [ ] Gate 7 (P7) — tagged phase-7-done
+- [x] Gate 7 (P7) — PASSED, commit 499daf4, tag phase-7-done
 - [ ] Gate 8 (P8) — tagged phase-8-done
 - [ ] Gate 9 (P9) — tagged phase-9-done
 - [ ] Gate 10 (P10) — tagged phase-10-done
