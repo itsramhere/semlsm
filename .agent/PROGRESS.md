@@ -79,7 +79,7 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 - [x] **P6.3** db_compact.go workers -> fast worker (L0->L1, L1->L2) never waiting on deep; deep raw worker (L2+ at score >= 1, interim until P10); WaitIdle (queues + scores, with obsolete draining); CompactLevel (manual trigger); obsolete deletion driven ONLY by version death (drainObsolete from workers + WaitIdle), keeping snapshot-pinned files on disk.
 - [x] **P6.4** compaction_test.go -> checkLSM helper (I3 order over files+memtables, L1+ non-overlap, full version multiset vs model); bulk load drives L0..L3; model test with concurrent compactions + snapshot churn + reopen + historical probes; pinned snapshot reads consumed files and they disappear after Release; crash at both compaction failpoints and reopen verify.
 
-**Gate 6:** fix(P6) re-run after M-015; re-review pending (unchecked until APPROVED, M-016 item 5). See G-024.
+**Gate 6:** fix(P6) fb81ad7 APPROVED (M-021, tag phase-6-done). M-015 fully closed.
 
 fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
 - item 3 (critical): planL0 now computes the L0 range as the union of all inputs (min Smallest / max Largest via CompareUser); the old file-order range missed a straddling L1 file, Apply rejected the edit and compaction retried forever.
@@ -174,9 +174,9 @@ fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
 - [ ] Gate 3 (P3) — tagged phase-3-done
 - [x] Gate 4 (P4) — PASSED, commit 7533df9, tag phase-4-done
 - [x] Gate 5 (P5) — PASSED, commit f039828, tag phase-5-done
-- [ ] Gate 6 (P6) — 97b3812 passed G-021 but M-015 reopened it; fix(P6) posted, awaiting verdict
+- [x] Gate 6 (P6) — PASSED (re-run): fix(P6) fb81ad7, tag phase-6-done, verdict M-021; 97b3812 was the original pass
 - [x] Gate 7 (P7) — PASSED, commit 499daf4, tag phase-7-done
-- [x] Gate 8 (P8) — PASSED, commit d76b556 (fix(P8) race on Usage), tag phase-8-done; see G-027. Note: P8.2-P8.6 landed before the G-025 verdict (A10 continuation); disclosed in G-026.
+- [x] Gate 8 (P8) — PASSED, commit d76b556 (fix(P8) race on Usage), tag phase-8-done, verdict M-022: approved on GATE EVIDENCE ONLY (no line-by-line review of internal/semantic). P8.2-P8.6 landed before the G-025 verdict (A10 continuation); disclosed in G-026. Run ended by M-023 STOP: P9-P15 not started.
 - [ ] Gate 9 (P9) — tagged phase-9-done
 - [ ] Gate 10 (P10) — tagged phase-10-done
 - [ ] Gate 11 (P11) — tagged phase-11-done
