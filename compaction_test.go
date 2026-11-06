@@ -2,10 +2,12 @@ package semlsm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -228,9 +230,14 @@ func TestCompactionModelConcurrent(t *testing.T) {
 		}
 	}()
 
-	const ops = 8000
+	// M-015 item 9: the concurrent model run is reduced under -short; gates
+	// always run the full workload.
+	shortOps := 8000
+	if testing.Short() {
+		shortOps = 2000
+	}
 	history := []uint64{}
-	for i := 0; i < ops; i++ {
+	for i := 0; i < shortOps; i++ {
 		batch := gen.Next(5)
 		b := NewBatch()
 		for _, r := range batch {
@@ -455,5 +462,233 @@ func TestCompactFailpointCrash(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// errCompactionFailed arms the compact.before_manifest failpoint in
+// TestCompactionBackoffOnPersistentError.
+var errCompactionFailed = errors.New("compaction failed (test)")
+
+// M-015 item 3 permanent scenario: L0 files whose key ranges are not
+// monotone in file number, plus reopen. The L1 file straddles the m
+// boundary, so only the union of the L0 ranges (a..z) selects it as an
+// overlap. Before the fix the range came from file order (m..c), the edit
+// was rejected by Apply, and the compaction retried forever: WaitIdle never
+// returned.
+func TestL0NonMonotoneRangesCompactionAndReopen(t *testing.T) {
+	fs := vfs.NewMemFS()
+	dir := "db"
+	opts := compactOptions(fs, base.RealClock{})
+	opts.L0CompactTrigger = 2
+	opts.L0StallTrigger = 12
+	opts.L1TargetBytes = 1 << 40 // keep the straddling L1 file in place
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := testmodel.NewModel()
+	commit := func(key string) {
+		b := NewBatch()
+		b.Put([]byte(key), []byte("value-"+key))
+		ts, err := db.Apply(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range b.recs {
+			b.recs[i].Ts = ts
+			model.Commit(b.recs[i : i+1])
+		}
+	}
+	bulk := func(prefix string, n int) {
+		for i := 0; i < n; i++ {
+			commit(fmt.Sprintf("%s%02d", prefix, i))
+		}
+	}
+
+	// L1 file e..o (straddles m): flush, then compact into L1 by hand
+	bulk("e", 40)
+	bulk("o", 40)
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompactLevel(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	// older L0 file m..z (smaller file number)
+	bulk("m", 40)
+	bulk("z", 40)
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// newer L0 file a..c (larger file number): reaches the trigger and
+	// fires the automatic L0->L1 compaction
+	bulk("a", 40)
+	bulk("c", 40)
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := db.WaitIdle(ctx); err != nil {
+		t.Fatalf("compaction never settled: %v", err)
+	}
+	checkLSM(t, db, model)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// reopen: everything reads back Exact
+	db2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	for _, key := range model.Keys() {
+		res, err := db2.Get(key)
+		if err != nil {
+			t.Fatalf("get %q: %v", key, err)
+		}
+		mts, mk, mv, mok := model.VisibleAt(key, model.MaxTs())
+		if !mok || mk == base.KindDelete {
+			if res.Kind != ResultNotFound {
+				t.Fatalf("%q should be absent: %+v", key, res)
+			}
+			continue
+		}
+		if res.Kind != ResultExact || res.VersionTs != mts || string(res.Value) != string(mv) {
+			t.Fatalf("%q: got %+v want (%d,%q)", key, res, mts, mv)
+		}
+	}
+}
+
+// M-015 item 5: a plan picked from an older version whose files were
+// consumed by another compaction is dropped with no error, no backoff and no
+// state change.
+func TestStalePlanDroppedSilently(t *testing.T) {
+	fs := vfs.NewMemFS()
+	opts := compactOptions(fs, base.RealClock{})
+	opts.L0CompactTrigger = 1 << 20 // no automatic picks
+	opts.L0StallTrigger = 1 << 21
+	opts.L1TargetBytes = 1 << 40
+	db, err := Open("db", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// three L0 files
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 20; j++ {
+			if _, err := db.Put([]byte(fmt.Sprintf("f%d_k%02d", i, j)), []byte("value-value-value")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := db.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	v := db.vs.Acquire()
+	plan := db.picker.PickLevel(v, 0, nil)
+	v.Unref()
+	if plan == nil {
+		t.Fatal("no plan picked from three L0 files")
+	}
+
+	// a real compaction consumes the same L0 files
+	if err := db.CompactLevel(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// the picked plan is now stale: dropped silently
+	files := func() map[int]map[uint64]bool {
+		v := db.vs.Acquire()
+		defer v.Unref()
+		out := map[int]map[uint64]bool{}
+		for l := range v.Levels {
+			out[l] = map[uint64]bool{}
+			for _, f := range v.Levels[l] {
+				out[l][f.Num] = true
+			}
+		}
+		return out
+	}
+	before := files()
+	if err := db.runStructural(plan); err != nil {
+		t.Fatalf("stale plan must be dropped without error: %v", err)
+	}
+	if after := files(); !equalFileSets(before, after) {
+		t.Fatal("stale plan changed the version")
+	}
+	db.mu.Lock()
+	inFlight, busy := db.compactionsInFlight, len(db.busy)
+	db.mu.Unlock()
+	if inFlight != 0 || busy != 0 {
+		t.Fatalf("state leak: inFlight=%d busy=%d", inFlight, busy)
+	}
+}
+
+func equalFileSets(a, b map[int]map[uint64]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for l := range a {
+		if len(a[l]) != len(b[l]) {
+			return false
+		}
+		for num := range a[l] {
+			if !b[l][num] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// M-015 item 6: a persistent compaction error backs off (100ms doubling to
+// 5s) instead of retrying every 10ms, counts each failure in Stats, and the
+// DB closes cleanly and settles once the failure is removed.
+func TestCompactionBackoffOnPersistentError(t *testing.T) {
+	fs := vfs.NewMemFS()
+	opts := compactOptions(fs, base.RealClock{})
+	opts.L0CompactTrigger = 2
+	opts.L0StallTrigger = 64
+	db, err := Open("db", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// enough data for several flushes: L0 reaches the trigger and the fast
+	// worker attempts the compaction
+	for i := 0; i < 400; i++ {
+		if _, err := db.Put([]byte(fmt.Sprintf("k%04d", i)), make([]byte, 500)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var hits atomic.Int64
+	failpoint.Set("compact.before_manifest", func() error {
+		hits.Add(1)
+		return errCompactionFailed
+	})
+	time.Sleep(1100 * time.Millisecond) // observe the attempt rate
+	failpoint.Reset()
+	// backoff 100->200->400->800ms: about 4-5 attempts in 1.1s; the old
+	// 10ms retry would exceed 100
+	if n := hits.Load(); n < 2 {
+		t.Fatalf("no retry observed: %d attempts", n)
+	} else if n > 25 {
+		t.Fatalf("compaction retry hot loop: %d attempts in ~1.1s", n)
+	}
+	if got := db.Stats().CompactionErrors; got < 2 || got > 25 {
+		t.Fatalf("Stats.CompactionErrors = %d, want 2..25", got)
+	}
+
+	// once the failure is removed, compaction settles
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := db.WaitIdle(ctx); err != nil {
+		t.Fatalf("did not settle after reset: %v", err)
 	}
 }

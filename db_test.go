@@ -1,15 +1,19 @@
 package semlsm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"semlsm/internal/base"
+	"semlsm/internal/manifest"
 	"semlsm/internal/testmodel"
 	"semlsm/internal/vfs"
 )
@@ -261,7 +265,12 @@ func TestModelWorkload(t *testing.T) {
 	}
 	defer db.Close()
 
-	const ops = 200000
+	// M-015 item 9: the 200k-op model run is reduced under -short; gates
+	// always run the full workload without -short.
+	ops := 200000
+	if testing.Short() {
+		ops = 20000
+	}
 	history := make([]uint64, 0, 1000) // sample of visible timestamps for later probes
 	for i := 0; i < ops; i++ {
 		batch := gen.Next(5)
@@ -395,7 +404,12 @@ func TestMemFSCrashMatrix(t *testing.T) {
 	seed := int64(4242)
 	rng := rand.New(rand.NewSource(seed))
 
-	for round := 0; round < 6; round++ {
+	// M-015 item 9: fewer crash rounds under -short; gates run all six.
+	rounds := 6
+	if testing.Short() {
+		rounds = 2
+	}
+	for round := 0; round < rounds; round++ {
 		fs := vfs.NewMemFS()
 		dir := "db"
 		db, err := Open(dir, testOptions(fs, base.RealClock{}))
@@ -496,7 +510,12 @@ func TestMultiSessionReopenFlushed(t *testing.T) {
 		value[i] = byte(i % 251)
 	}
 	var expect []string
-	for session := 0; session < 4; session++ {
+	// M-015 item 9: fewer sessions under -short; gates run all four.
+	sessions := 4
+	if testing.Short() {
+		sessions = 2
+	}
+	for session := 0; session < sessions; session++ {
 		db, err := Open(dir, testOptions(fs, base.RealClock{}))
 		if err != nil {
 			t.Fatalf("session %d: open: %v", session, err)
@@ -539,7 +558,12 @@ func TestMultiSessionCrashClone(t *testing.T) {
 	value := make([]byte, 2048)
 	current := fs
 	var expect []string
-	for session := 0; session < 4; session++ {
+	// M-015 item 9: fewer sessions under -short; gates run all four.
+	sessions := 4
+	if testing.Short() {
+		sessions = 2
+	}
+	for session := 0; session < sessions; session++ {
 		db, err := Open(dir, testOptions(current, base.RealClock{}))
 		if err != nil {
 			t.Fatalf("session %d: open: %v", session, err)
@@ -655,5 +679,148 @@ func TestFlushBackoffOnPersistentError(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("close on failed flusher: %v", err)
+	}
+}
+
+// M-015 item 2 permanent scenario: an SST removed behind the DB's back must
+// produce an error on every read path, never a silent fall-through to an
+// older version in a deeper level (I10/I12).
+func TestSSTRemovedBehindBack(t *testing.T) {
+	fs := vfs.NewMemFS()
+	dir := "db"
+	opts := compactOptions(fs, base.RealClock{})
+	opts.L0CompactTrigger = 1 << 20 // no automatic compaction
+	opts.L0StallTrigger = 1 << 21
+	opts.L1TargetBytes = 1 << 40
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// file A (older): k keys; file B (newer): j keys
+	for i := 0; i < 50; i++ {
+		if _, err := db.Put([]byte(fmt.Sprintf("k%03d", i)), make([]byte, 300)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	v := db.vs.Acquire()
+	if len(v.Levels[0]) != 1 {
+		t.Fatalf("L0 has %d files, want 1", len(v.Levels[0]))
+	}
+	aNum := v.Levels[0][0].Num
+	v.Unref()
+	for i := 0; i < 50; i++ {
+		if _, err := db.Put([]byte(fmt.Sprintf("j%03d", i)), make([]byte, 300)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// remove A behind the DB's back; it has never been read, so the table
+	// cache does not mask the loss
+	if err := fs.Remove(filepath.Join(dir, sstName(aNum))); err != nil {
+		t.Fatal(err)
+	}
+
+	// a key that lived in A must error, never fall through to another file
+	if res, err := db.Get([]byte("k000")); err == nil {
+		t.Fatalf("missing SST read silently: %+v", res)
+	}
+	// a key in the intact file still reads
+	res, err := db.Get([]byte("j000"))
+	if err != nil || res.Kind != ResultExact {
+		t.Fatalf("intact file read: %+v err=%v", res, err)
+	}
+	// snapshot reads surface the same error
+	snap := db.NewSnapshot()
+	if _, err := snap.Get([]byte("k000")); err == nil {
+		t.Fatal("snapshot: missing SST read silently")
+	}
+	snap.Release()
+	// iteration fails rather than skipping the file silently
+	it := db.NewIterator(IterOptions{})
+	if it.Next() {
+		t.Fatalf("iterator produced entries despite a missing SST: %q", it.Result().Key)
+	}
+	if err := it.Err(); err == nil {
+		t.Fatal("iterator did not report the missing SST")
+	}
+	it.Close()
+}
+
+// M-015 item 4: a rejected manifest edit must leave the manifest bytes
+// identical (no durable garbage that bricks the next Open) and the DB must
+// keep working and reopen.
+func TestManifestEditValidatedBeforeAppend(t *testing.T) {
+	fs := vfs.NewMemFS()
+	dir := "db"
+	db, err := Open(dir, testOptions(fs, base.RealClock{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, err := db.Put([]byte(fmt.Sprintf("k%03d", i)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes := func() []byte {
+		t.Helper()
+		name, err := manifest.ReadCurrent(fs, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := fs.Open(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		data, err := io.ReadAll(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	before := manifestBytes()
+
+	// del of an unknown file: rejected by Validate before the append
+	db.manifestMu.Lock()
+	err = db.appendManifestLocked(&manifest.Edit{
+		DelFiles: []manifest.DelFile{{Level: 0, Num: 999999}},
+	}, 0)
+	db.manifestMu.Unlock()
+	if err == nil {
+		t.Fatal("invalid edit accepted")
+	}
+	if after := manifestBytes(); !bytes.Equal(before, after) {
+		t.Fatal("manifest changed on a rejected edit")
+	}
+	// the DB still serves reads and closes cleanly
+	if res, err := db.Get([]byte("k007")); err != nil || res.Kind != ResultExact {
+		t.Fatalf("read after rejected edit: %+v err=%v", res, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// reopen: the manifest replays cleanly
+	db2, err := Open(dir, testOptions(fs, base.RealClock{}))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	for i := 0; i < 50; i++ {
+		res, err := db2.Get([]byte(fmt.Sprintf("k%03d", i)))
+		if err != nil || res.Kind != ResultExact {
+			t.Fatalf("key %03d after reopen: %+v err=%v", i, res, err)
+		}
 	}
 }

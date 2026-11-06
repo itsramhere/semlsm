@@ -1,6 +1,8 @@
 package semlsm
 
 import (
+	"fmt"
+
 	"semlsm/internal/base"
 	"semlsm/internal/memtable"
 	"semlsm/internal/merge"
@@ -52,6 +54,11 @@ func (db *DB) newIteratorAt(o IterOptions, s uint64, rs *readState, snap *Snapsh
 		for _, f := range level {
 			reader, rel, err := db.tableCache.Get(f.Num)
 			if err != nil {
+				// A table that cannot be opened must fail the iteration
+				// (M-015 item 2): skipping it would silently omit keys.
+				if it.err == nil {
+					it.err = fmt.Errorf("semlsm: open sst %d: %w", f.Num, err)
+				}
 				continue
 			}
 			it.releases = append(it.releases, rel)

@@ -93,10 +93,18 @@ func (db *DB) GetAt(key []byte, s uint64) (Result, error) {
 	return db.getAtState(key, s, rs)
 }
 
-// getAtState resolves one read against a pinned read state (B6).
+// getAtState resolves one read against a pinned read state (B6). Read and
+// checkpoint errors propagate to the caller: a corrupt or missing file must
+// never turn into a stale answer (I10, I12; M-015 item 2).
 func (db *DB) getAtState(key []byte, s uint64, rs *readState) (Result, error) {
-	raw, value := db.rawLookup(key, s, rs)
-	entry, hit := db.checkpointLookup(key, s, rs)
+	raw, value, err := db.rawLookup(key, s, rs)
+	if err != nil {
+		return Result{}, err
+	}
+	entry, hit, err := db.checkpointLookup(key, s, rs)
+	if err != nil {
+		return Result{}, err
+	}
 	outcome := resolve.Resolve(s, raw, entry)
 	switch outcome {
 	case resolve.NotFound:
@@ -133,15 +141,17 @@ func (db *DB) getAtState(key []byte, s uint64, rs *readState) (Result, error) {
 }
 
 // rawLookup finds the newest raw version of key with ts <= s (B6 lookup)
-// together with its value. The value aliases engine buffers.
-func (db *DB) rawLookup(key []byte, s uint64, rs *readState) (resolve.Raw, []byte) {
+// together with its value. The value aliases engine buffers. Any storage
+// error aborts the lookup with an error (M-015 item 2): falling through to a
+// deeper level would return a stale version (I10).
+func (db *DB) rawLookup(key []byte, s uint64, rs *readState) (resolve.Raw, []byte, error) {
 	// 1. active memtable, then immutable memtables newest to oldest
 	if ts, kind, value, ok := rs.mem.Get(key, s); ok {
-		return resolve.Raw{Found: true, Ts: ts, Kind: kind}, value
+		return resolve.Raw{Found: true, Ts: ts, Kind: kind}, value, nil
 	}
 	for _, im := range rs.imms {
 		if ts, kind, value, ok := im.mem.Get(key, s); ok {
-			return resolve.Raw{Found: true, Ts: ts, Kind: kind}, value
+			return resolve.Raw{Found: true, Ts: ts, Kind: kind}, value, nil
 		}
 	}
 	// 2. L0 files in descending file number (already sorted newest first)
@@ -153,8 +163,12 @@ func (db *DB) rawLookup(key []byte, s uint64, rs *readState) (resolve.Raw, []byt
 		if !fileMayContain(f, key) {
 			continue
 		}
-		if ts, kind, value, ok := db.sstGet(f.Num, key, s); ok {
-			return resolve.Raw{Found: true, Ts: ts, Kind: kind}, value
+		ts, kind, value, ok, err := db.sstGet(f.Num, key, s)
+		if err != nil {
+			return resolve.Raw{}, nil, err
+		}
+		if ok {
+			return resolve.Raw{Found: true, Ts: ts, Kind: kind}, value, nil
 		}
 	}
 	// 3. L1..L4: the one file whose range may contain the key
@@ -166,26 +180,31 @@ func (db *DB) rawLookup(key []byte, s uint64, rs *readState) (resolve.Raw, []byt
 			if !fileMayContain(f, key) {
 				continue
 			}
-			if ts, kind, value, ok := db.sstGet(f.Num, key, s); ok {
-				return resolve.Raw{Found: true, Ts: ts, Kind: kind}, value
+			ts, kind, value, ok, err := db.sstGet(f.Num, key, s)
+			if err != nil {
+				return resolve.Raw{}, nil, err
+			}
+			if ok {
+				return resolve.Raw{Found: true, Ts: ts, Kind: kind}, value, nil
 			}
 		}
 	}
-	return resolve.Raw{}, nil
+	return resolve.Raw{}, nil, nil
 }
 
-// sstGet reads one file through the table cache.
-func (db *DB) sstGet(num uint64, key []byte, s uint64) (ts uint64, kind base.Kind, value []byte, ok bool) {
+// sstGet reads one file through the table cache. Errors from opening the
+// table or reading blocks are returned, never swallowed (M-015 item 2).
+func (db *DB) sstGet(num uint64, key []byte, s uint64) (ts uint64, kind base.Kind, value []byte, ok bool, err error) {
 	r, rel, err := db.tableCache.Get(num)
 	if err != nil {
-		return 0, 0, nil, false
+		return 0, 0, nil, false, err
 	}
 	defer rel()
 	ts, kind, value, ok, err = r.Get(key, s)
 	if err != nil {
-		return 0, 0, nil, false
+		return 0, 0, nil, false, err
 	}
-	return ts, kind, value, ok
+	return ts, kind, value, ok, nil
 }
 
 // fileMayContain checks the user-key range of a file's metadata.
@@ -204,12 +223,13 @@ type ckptHit struct {
 
 // checkpointLookup implements P7.3: for (K, S), walk the group's tuple refs
 // with TsFrom <= S, checking each tuple's key index; keep the entry with the
-// largest MinTs <= S.
-func (db *DB) checkpointLookup(key []byte, s uint64, rs *readState) (resolve.Entry, *ckptHit) {
+// largest MinTs <= S. Checkpoint open or index errors are returned (M-015
+// item 2), never treated as "no summary".
+func (db *DB) checkpointLookup(key []byte, s uint64, rs *readState) (resolve.Entry, *ckptHit, error) {
 	group := string(base.GroupOf(key, db.opts.GroupDepth, db.opts.GroupDelimiter))
 	refs := rs.version.Ckpts.GroupRefs(group)
 	if len(refs) == 0 {
-		return resolve.Entry{}, nil
+		return resolve.Entry{}, nil, nil
 	}
 	var best resolve.Entry
 	var hit *ckptHit
@@ -220,10 +240,20 @@ func (db *DB) checkpointLookup(key []byte, s uint64, rs *readState) (resolve.Ent
 		}
 		r, rel, err := db.ckptCache.Get(loc.FileNum)
 		if err != nil {
-			continue
+			if hit != nil {
+				hit.rel()
+			}
+			return resolve.Entry{}, nil, err
 		}
 		ke, ok, lerr := r.LookupKey(ref.ID, key)
-		if lerr != nil || !ok {
+		if lerr != nil {
+			rel()
+			if hit != nil {
+				hit.rel()
+			}
+			return resolve.Entry{}, nil, lerr
+		}
+		if !ok {
 			rel()
 			continue
 		}
@@ -245,16 +275,16 @@ func (db *DB) checkpointLookup(key []byte, s uint64, rs *readState) (resolve.Ent
 		}
 		rel()
 	}
-	return best, hit
+	return best, hit, nil
 }
 
 // checkpointEntry returns the covering checkpoint entry for (key, s).
-func (db *DB) checkpointEntry(key []byte, s uint64, rs *readState) resolve.Entry {
-	e, hit := db.checkpointLookup(key, s, rs)
+func (db *DB) checkpointEntry(key []byte, s uint64, rs *readState) (resolve.Entry, error) {
+	e, hit, err := db.checkpointLookup(key, s, rs)
 	if hit != nil {
 		hit.rel()
 	}
-	return e
+	return e, err
 }
 
 // checkpointInfoFor builds the CheckpointInfo for a summarized read (P7.4):

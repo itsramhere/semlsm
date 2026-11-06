@@ -118,6 +118,20 @@ func (v *Version) Unref() {
 // Refs returns the current reference count (tests).
 func (v *Version) Refs() int64 { return v.refs.Load() }
 
+// HasFile reports whether num is a member of this version's levels (M-015
+// item 5): plans picked from an older version must be re-checked against the
+// current one before their files are marked busy.
+func (v *Version) HasFile(num uint64) bool {
+	for _, level := range v.Levels {
+		for _, fm := range level {
+			if fm.Num == num {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // VersionSet applies edits and tracks file liveness.
 type VersionSet struct {
 	mu      sync.Mutex
@@ -171,7 +185,72 @@ func (vs *VersionSet) Apply(e *manifest.Edit) (*Version, error) {
 	defer vs.mu.Unlock()
 
 	old := vs.current
+	newVersion, err := vs.buildVersionLocked(old, e)
+	if err != nil {
+		return nil, err
+	}
 
+	// Bookkeeping: monotone max of each counter (M-011 item 2). An edit built
+	// earlier must never roll back the allocator, the timestamp, or the WAL
+	// pointer — reusing file numbers would overwrite live files and repeated
+	// timestamps would break I2.
+	// New file numbers in the edit also raise the allocator (M-013 item 1c):
+	// edits without NextFileNum must not let the allocator restart below
+	// numbers now in use.
+	for i := range e.AddFiles {
+		if e.AddFiles[i].Num >= vs.NextFileNum {
+			vs.NextFileNum = e.AddFiles[i].Num + 1
+		}
+	}
+	for i := range e.AddCkpts {
+		if e.AddCkpts[i].FileNum >= vs.NextFileNum {
+			vs.NextFileNum = e.AddCkpts[i].FileNum + 1
+		}
+	}
+	if e.NextFileNum > vs.NextFileNum {
+		vs.NextFileNum = e.NextFileNum
+	}
+	if e.LastTs > vs.LastTs {
+		vs.LastTs = e.LastTs
+	}
+	if e.LogNum > vs.LogNum {
+		vs.LogNum = e.LogNum
+	}
+
+	// Reference accounting (M-010 era fix): file.refs counts live VERSION
+	// memberships. The new version takes membership on its files; the old
+	// version releases membership only when it dies (refs reach 0), which
+	// may be long after Apply if readers still hold it.
+	newVersion.refs.Store(1)
+	for _, level := range newVersion.Levels {
+		for _, fm := range level {
+			fm.refs.Add(1)
+			vs.live[fm.Num] = fm
+			vs.refs[fm.Num] = fm.refs.Load()
+		}
+	}
+
+	vs.current = newVersion
+	if old.refs.Add(-1) == 0 {
+		vs.releaseVersionLocked(old)
+	}
+	return newVersion, nil
+}
+
+// Validate runs every check Apply performs without changing anything
+// (M-015 item 4): callers can reject a bad edit before it becomes durable in
+// the manifest, where it would brick the next Open.
+func (vs *VersionSet) Validate(e *manifest.Edit) error {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	_, err := vs.buildVersionLocked(vs.current, e)
+	return err
+}
+
+// buildVersionLocked constructs the Version the edit would produce and
+// validates it against old, mutating neither the set nor any refcount.
+// Apply installs the result; Validate discards it. Callers must hold vs.mu.
+func (vs *VersionSet) buildVersionLocked(old *Version, e *manifest.Edit) (*Version, error) {
 	// Validate dels against the current version first (M-011 item 5):
 	// deleting an unknown file, or with a mismatched level, is corruption.
 	delSet := map[uint64]manifest.DelFile{}
@@ -253,51 +332,6 @@ func (vs *VersionSet) Apply(e *manifest.Edit) (*Version, error) {
 		newVersion.Ckpts.ByNum[cf.FileNum] = &cf
 	}
 	newVersion.Ckpts.rebuildGroups()
-
-	// Bookkeeping: monotone max of each counter (M-011 item 2). An edit built
-	// earlier must never roll back the allocator, the timestamp, or the WAL
-	// pointer — reusing file numbers would overwrite live files and repeated
-	// timestamps would break I2.
-	// New file numbers in the edit also raise the allocator (M-013 item 1c):
-	// edits without NextFileNum must not let the allocator restart below
-	// numbers now in use.
-	for i := range e.AddFiles {
-		if e.AddFiles[i].Num >= vs.NextFileNum {
-			vs.NextFileNum = e.AddFiles[i].Num + 1
-		}
-	}
-	for i := range e.AddCkpts {
-		if e.AddCkpts[i].FileNum >= vs.NextFileNum {
-			vs.NextFileNum = e.AddCkpts[i].FileNum + 1
-		}
-	}
-	if e.NextFileNum > vs.NextFileNum {
-		vs.NextFileNum = e.NextFileNum
-	}
-	if e.LastTs > vs.LastTs {
-		vs.LastTs = e.LastTs
-	}
-	if e.LogNum > vs.LogNum {
-		vs.LogNum = e.LogNum
-	}
-
-	// Reference accounting (M-010 era fix): file.refs counts live VERSION
-	// memberships. The new version takes membership on its files; the old
-	// version releases membership only when it dies (refs reach 0), which
-	// may be long after Apply if readers still hold it.
-	newVersion.refs.Store(1)
-	for _, level := range newVersion.Levels {
-		for _, fm := range level {
-			fm.refs.Add(1)
-			vs.live[fm.Num] = fm
-			vs.refs[fm.Num] = fm.refs.Load()
-		}
-	}
-
-	vs.current = newVersion
-	if old.refs.Add(-1) == 0 {
-		vs.releaseVersionLocked(old)
-	}
 	return newVersion, nil
 }
 

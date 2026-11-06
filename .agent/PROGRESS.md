@@ -79,7 +79,19 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 - [x] **P6.3** db_compact.go workers -> fast worker (L0->L1, L1->L2) never waiting on deep; deep raw worker (L2+ at score >= 1, interim until P10); WaitIdle (queues + scores, with obsolete draining); CompactLevel (manual trigger); obsolete deletion driven ONLY by version death (drainObsolete from workers + WaitIdle), keeping snapshot-pinned files on disk.
 - [x] **P6.4** compaction_test.go -> checkLSM helper (I3 order over files+memtables, L1+ non-overlap, full version multiset vs model); bulk load drives L0..L3; model test with concurrent compactions + snapshot churn + reopen + historical probes; pinned snapshot reads consumed files and they disappear after Release; crash at both compaction failpoints and reopen verify.
 
-**Gate 6:** full raw LSM passes all. — PASSED, see G-021.
+**Gate 6:** fix(P6) re-run after M-015; re-review pending (unchecked until APPROVED, M-016 item 5). See G-024.
+
+fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
+- item 3 (critical): planL0 now computes the L0 range as the union of all inputs (min Smallest / max Largest via CompareUser); the old file-order range missed a straddling L1 file, Apply rejected the edit and compaction retried forever.
+- NEW BUG found by the item-3 scenario test: openRecover built the readState BEFORE the manifest load, so a clean reopen (active WAL empty at Close, nothing to replay) served NotFound for every key until the first install. rs is now built after loadOrCreateManifest. Every earlier reopen test had unflushed WAL data, whose recovered flush masked it.
+- item 2: sstGet/rawLookup/checkpointLookup/Get/GetAt/Snapshot.Get propagate storage errors; iterator records unopenable tables in Err() instead of skipping. TestSSTRemovedBehindBack.
+- item 4: VersionSet.Validate runs Apply's checks dry-run; appendManifestLocked validates BEFORE Append+Sync, so a rejected edit leaves the manifest byte-identical. TestManifestEditValidatedBeforeAppend.
+- item 5: runStructural re-checks plan files against the current version (Version.HasFile) while marking busy; stale plans and busy files drop silently (no error, no backoff). TestStalePlanDroppedSilently.
+- item 6: both compaction loops back off 100ms doubling to 5s (exit on close), count failures in Stats.CompactionErrors, log per retry. TestCompactionBackoffOnPersistentError (failpoint-counted attempts).
+- item 8: internal/compaction/picker_test.go - L0 range union, busy at each position, round-robin cursor, overlap edges (lo==hi touching), scores, bottom-level boundary.
+- item 9: testing.Short() reductions - model 200k->20k, concurrent model 8000->2000, crash matrix 6->2 rounds, multi-session 4->2 (root: ~30s -> ~4s under -short).
+- permanent scenarios: TestSnapshotPinsFilesUntilRelease (already existed), TestL0NonMonotoneRangesCompactionAndReopen, TestSSTRemovedBehindBack.
+- removed the temporary dbgLogCompaction stack-capture hook (unused since the pin-race investigation).
 
 ## P7. Checkpoint format and transparent resolution
 - [x] **P7.1** internal/checkpoint -> Writer (SLCK header, tuples: meta JSON+CRC, flate-if-smaller summary/index sections with codec byte in CRC, prefix-compressed key index with restarts every 32 + bloom + fixed trailer, framed JSON directory, 24B footer) + Reader (footer/dir validation, lazy per-tuple parse cache, LookupKey with restart binary search, IterKeys) + ref-counted CkptCache. 5 tests: round trip, 50k keys, single key/empty summary, byte-flip matrix, prefix compression.
@@ -162,7 +174,7 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 - [ ] Gate 3 (P3) — tagged phase-3-done
 - [x] Gate 4 (P4) — PASSED, commit 7533df9, tag phase-4-done
 - [x] Gate 5 (P5) — PASSED, commit f039828, tag phase-5-done
-- [x] Gate 6 (P6) — PASSED, commit 97b3812, tag phase-6-done
+- [ ] Gate 6 (P6) — 97b3812 passed G-021 but M-015 reopened it; fix(P6) posted, awaiting verdict
 - [x] Gate 7 (P7) — PASSED, commit 499daf4, tag phase-7-done
 - [ ] Gate 8 (P8) — tagged phase-8-done
 - [ ] Gate 9 (P9) — tagged phase-9-done

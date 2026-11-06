@@ -397,3 +397,59 @@ func TestVersionConcurrentUnrefSingleRelease(t *testing.T) {
 		}
 	}
 }
+
+// M-015 item 4: Validate runs Apply's checks without changing anything.
+func TestValidateDryRun(t *testing.T) {
+	vs := NewVersionSet()
+	e1 := &manifest.Edit{AddFiles: []manifest.FileMeta{
+		{Level: 0, Num: 1, Smallest: base.MakeInternalKey([]byte("a"), 5, base.KindPut), Largest: base.MakeInternalKey([]byte("m"), 5, base.KindPut), MinTs: 5, MaxTs: 5, Count: 1},
+	}}
+	if _, err := vs.Apply(e1); err != nil {
+		t.Fatal(err)
+	}
+	// an L1 file so the overlap case has something to overlap
+	eL1 := &manifest.Edit{AddFiles: []manifest.FileMeta{
+		{Level: 1, Num: 4, Smallest: base.MakeInternalKey([]byte("c"), 6, base.KindPut), Largest: base.MakeInternalKey([]byte("g"), 6, base.KindPut), MinTs: 6, MaxTs: 6, Count: 1},
+	}}
+	if _, err := vs.Apply(eL1); err != nil {
+		t.Fatal(err)
+	}
+
+	// good edit validates
+	e2 := &manifest.Edit{AddFiles: []manifest.FileMeta{
+		{Level: 0, Num: 2, Smallest: base.MakeInternalKey([]byte("n"), 6, base.KindPut), Largest: base.MakeInternalKey([]byte("z"), 6, base.KindPut), MinTs: 6, MaxTs: 6, Count: 1},
+	}}
+	if err := vs.Validate(e2); err != nil {
+		t.Fatalf("valid edit rejected: %v", err)
+	}
+	if n := vs.VersionCount(); n != 2 {
+		t.Fatalf("Validate changed the set: %d live files", n)
+	}
+
+	// every rejected shape fails Validate too
+	bad := []struct {
+		name string
+		e    *manifest.Edit
+	}{
+		{"del unknown", &manifest.Edit{DelFiles: []manifest.DelFile{{Level: 0, Num: 99}}}},
+		{"del level mismatch", &manifest.Edit{DelFiles: []manifest.DelFile{{Level: 1, Num: 1}}}},
+		{"add of live", &manifest.Edit{AddFiles: []manifest.FileMeta{
+			{Level: 0, Num: 1, Smallest: base.MakeInternalKey([]byte("a"), 5, base.KindPut), Largest: base.MakeInternalKey([]byte("m"), 5, base.KindPut)},
+		}}},
+		{"L1 overlap", &manifest.Edit{AddFiles: []manifest.FileMeta{
+			{Level: 1, Num: 3, Smallest: base.MakeInternalKey([]byte("b"), 7, base.KindPut), Largest: base.MakeInternalKey([]byte("z"), 7, base.KindPut), MinTs: 7, MaxTs: 7, Count: 1},
+		}}},
+	}
+	for _, tc := range bad {
+		if err := vs.Validate(tc.e); err == nil {
+			t.Fatalf("%s: Validate accepted", tc.name)
+		}
+		if n := vs.VersionCount(); n != 2 {
+			t.Fatalf("%s: Validate changed the set", tc.name)
+		}
+	}
+	// after all the rejected validates, the good edit still applies
+	if _, err := vs.Apply(e2); err != nil {
+		t.Fatalf("apply after validates: %v", err)
+	}
+}

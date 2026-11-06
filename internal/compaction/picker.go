@@ -124,8 +124,19 @@ func (p *Picker) planL0(v *version.Version, busy map[uint64]bool) *Plan {
 		}
 		inputs = append(inputs, f)
 	}
-	lo := base.UserKey(inputs[len(inputs)-1].Smallest) // L0 sorted num-desc: last is smallest
+	// The L0 range is the UNION of every input's range (M-015 item 3): L0
+	// files overlap and are ordered by file number, not by key, so neither
+	// the first nor the last file bounds the set.
+	lo := base.UserKey(inputs[0].Smallest)
 	hi := base.UserKey(inputs[0].Largest)
+	for _, f := range inputs[1:] {
+		if base.CompareUser(base.UserKey(f.Smallest), lo) < 0 {
+			lo = base.UserKey(f.Smallest)
+		}
+		if base.CompareUser(base.UserKey(f.Largest), hi) > 0 {
+			hi = base.UserKey(f.Largest)
+		}
+	}
 	ovs, ok := overlapRange(v.Levels[1], lo, hi, busy)
 	if !ok {
 		return nil

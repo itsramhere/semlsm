@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"runtime"
 	"time"
 
 	"semlsm/internal/base"
@@ -42,8 +41,11 @@ func (db *DB) startCompactionWorkers() {
 }
 
 // fastCompactLoop drives L0->L1 and L1->L2 (one worker; never waits on deep).
+// Compaction errors back off with growing sleeps (100ms doubling to 5s) like
+// the flush path, and each failure is counted in Stats (M-015 item 6).
 func (db *DB) fastCompactLoop() {
 	defer db.compactWG.Done()
+	backoff := 100 * time.Millisecond
 	for {
 		if db.closed.Load() {
 			return
@@ -60,15 +62,21 @@ func (db *DB) fastCompactLoop() {
 			continue
 		}
 		if err := db.runStructural(plan); err != nil {
+			db.compactErrs.Add(1)
 			db.logger.Warn("semlsm: fast compaction failed", "err", err)
-			time.Sleep(10 * time.Millisecond) // back off, then retry
+			if !db.compactBackoff(&backoff) {
+				return
+			}
+			continue
 		}
+		backoff = 100 * time.Millisecond
 	}
 }
 
 // deepRawLoop moves L2+ data down raw when scores exceed 1 (P6.3 interim).
 func (db *DB) deepRawLoop() {
 	defer db.compactWG.Done()
+	backoff := 100 * time.Millisecond
 	for {
 		if db.closed.Load() {
 			return
@@ -85,10 +93,30 @@ func (db *DB) deepRawLoop() {
 			continue
 		}
 		if err := db.runStructural(plan); err != nil {
+			db.compactErrs.Add(1)
 			db.logger.Warn("semlsm: deep compaction failed", "err", err)
-			time.Sleep(10 * time.Millisecond)
+			if !db.compactBackoff(&backoff) {
+				return
+			}
+			continue
 		}
+		backoff = 100 * time.Millisecond
 	}
+}
+
+// compactBackoff sleeps for the current backoff step, doubling it up to 5s.
+// It returns false when the DB closed during the sleep (the worker exits
+// instead of retrying forever).
+func (db *DB) compactBackoff(backoff *time.Duration) bool {
+	select {
+	case <-db.closeCh:
+		return false
+	case <-time.After(*backoff):
+	}
+	if *backoff < 5*time.Second {
+		*backoff *= 2
+	}
+	return true
 }
 
 // pickFast returns a plan from a consistent version snapshot.
@@ -127,21 +155,32 @@ func (db *DB) busySnapshotLocked() map[uint64]bool {
 // runStructural merges plan inputs into OutputLevel with an atomic manifest
 // edit (P6.2). All versions and tombstones are retained.
 func (db *DB) runStructural(plan *compaction.Plan) error {
-	if dbgLogCompaction != nil {
-		buf := make([]byte, 2000)
-		n := runtime.Stack(buf, false)
-		dbgLogCompaction(fmt.Sprintf("runStructural L%d->L%d inputs=%d\n%s",
-			plan.Level, plan.OutputLevel, len(plan.Inputs), buf[:n]))
-	}
 	v := db.vs.Acquire()
 	defer v.Unref()
 
 	files := plan.AllFiles()
 	db.mu.Lock()
+	if db.rs == nil {
+		db.mu.Unlock()
+		return nil
+	}
+	// The plan was picked from an older version (M-015 item 5): another
+	// compaction may have consumed its files in between. Re-check membership
+	// against the current version while marking busy; a stale plan is dropped
+	// with no error and no backoff.
+	for _, f := range files {
+		if !db.rs.version.HasFile(f.Num) {
+			db.mu.Unlock()
+			return nil
+		}
+	}
 	for _, f := range files {
 		if db.busy[f.Num] {
+			// Another compaction owns the file: drop the plan silently and
+			// re-pick later (the picker already avoids busy files; this is
+			// the race window).
 			db.mu.Unlock()
-			return fmt.Errorf("semlsm: file %d became busy", f.Num)
+			return nil
 		}
 	}
 	for _, f := range files {
@@ -390,6 +429,3 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (VerifyReport, error) {
 	}
 	return rep, nil
 }
-
-// dbgLogCompaction is a temporary test hook for compaction tracing.
-var dbgLogCompaction func(msg string)

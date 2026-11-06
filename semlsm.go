@@ -57,6 +57,7 @@ type Stats struct {
 	SnapshotsOpen      int
 	LevelFiles         [base.NumLevels]int
 	LevelBytes         [base.NumLevels]int64
+	CompactionErrors   uint64 // failed compaction attempts since Open (M-015 item 6)
 }
 
 // immEntry is one immutable memtable awaiting flush, with the WAL number
@@ -135,6 +136,7 @@ type DB struct {
 
 	stallNanos    atomic.Int64
 	snapshotsOpen atomic.Int64
+	compactErrs   atomic.Uint64 // failed compaction attempts (Stats)
 
 	snapsMu sync.Mutex
 	snaps   map[*Snapshot]struct{}
@@ -232,13 +234,19 @@ func (db *DB) openRecover() error {
 	db.mu.Lock()
 	mem := memtable.New()
 	db.mem = mem
-	db.rs = &readState{mem: mem, version: db.vs.Acquire()}
 	db.mu.Unlock()
 
-	// Manifest: CURRENT or fresh.
+	// Manifest: CURRENT or fresh. The readState is built only after the
+	// manifest is loaded: building it earlier would pin the empty
+	// pre-replay version, and a clean reopen (no WAL data to replay, so no
+	// recovered flush) would serve NotFound for every key until the first
+	// install replaced the read state.
 	if err := db.loadOrCreateManifest(); err != nil {
 		return err
 	}
+	db.mu.Lock()
+	db.rs = &readState{mem: mem, version: db.vs.Acquire()}
+	db.mu.Unlock()
 
 	// Active WAL: created before replay; recovery replays older WALs and
 	// flushes them into L0 (P5.2 "simple, avoids WAL reuse").
@@ -494,12 +502,18 @@ func (db *DB) rewriteManifestLocked() error {
 // (M-013 item 1a), syncs it, and applies it to the VersionSet. manifestMu
 // must be held; lastTs is the edit's commit-timestamp context (a flushed
 // memtable's max ts, or the VersionSet's for non-flush edits).
+// The edit is validated BEFORE it becomes durable (M-015 item 4): a rejected
+// edit must leave the manifest bytes untouched, or the next Open replays it,
+// fails, and the DB is bricked.
 func (db *DB) appendManifestLocked(e *manifest.Edit, lastTs uint64) error {
 	e.NextFileNum = db.nextFileNum
 	if lastTs > db.vs.CurrentLastTs() {
 		e.LastTs = lastTs
 	} else {
 		e.LastTs = db.vs.CurrentLastTs()
+	}
+	if err := db.vs.Validate(e); err != nil {
+		return fmt.Errorf("semlsm: validate edit: %w", err)
 	}
 	if err := db.manifest.Append(e); err != nil {
 		return err
@@ -508,6 +522,8 @@ func (db *DB) appendManifestLocked(e *manifest.Edit, lastTs uint64) error {
 		return err
 	}
 	if _, aerr := db.vs.Apply(e); aerr != nil {
+		// Unreachable: Apply's checks are identical to Validate's and the
+		// set cannot change in between (manifestMu serializes all writers).
 		return fmt.Errorf("semlsm: apply edit: %w", aerr)
 	}
 	// roll the manifest at the size threshold
@@ -684,6 +700,7 @@ func (db *DB) Stats() Stats {
 	s.LastTs = db.lastTs
 	s.StallTime = time.Duration(db.stallNanos.Load())
 	s.SnapshotsOpen = int(db.snapshotsOpen.Load())
+	s.CompactionErrors = db.compactErrs.Load()
 	return s
 }
 
