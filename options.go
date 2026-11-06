@@ -24,40 +24,23 @@ const (
 	SyncNone
 )
 
-// Mode is the summarization policy for a key prefix (B4).
-type Mode uint8
+// Mode is the summarization policy for a key prefix (B4). The canonical
+// definition lives in internal/base (shared with internal/semantic, which
+// may not import the root); this alias keeps the public API unchanged.
+type Mode = base.Mode
 
 const (
 	// ModeDisabled never summarizes.
-	ModeDisabled Mode = iota
+	ModeDisabled = base.ModeDisabled
 	// ModeState is for repeatedly updated keys: the newest version is never dropped.
-	ModeState
+	ModeState = base.ModeState
 	// ModeEvents is for append-only streams: the newest version may be dropped.
-	ModeEvents
+	ModeEvents = base.ModeEvents
 )
 
-// String returns the mode name.
-func (m Mode) String() string {
-	switch m {
-	case ModeDisabled:
-		return "disabled"
-	case ModeState:
-		return "state"
-	case ModeEvents:
-		return "events"
-	default:
-		return "unknown"
-	}
-}
-
 // Policy selects which keys Tier B may summarize and under what conditions.
-type Policy struct {
-	Prefix   string
-	Mode     Mode
-	MinAge   time.Duration // never summarize records younger than this; default 1h
-	MinBatch int           // fewer eligible records -> stay raw; default 1000
-	MaxBatch int           // records per tuple; default 10000
-}
+// Alias of base.Policy for the same reason as Mode.
+type Policy = base.Policy
 
 // Options configures Open. Zero fields take their defaults from withDefaults.
 type Options struct {
