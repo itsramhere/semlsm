@@ -176,7 +176,7 @@ fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
 - [x] Gate 5 (P5) — PASSED, commit f039828, tag phase-5-done
 - [ ] Gate 6 (P6) — 97b3812 passed G-021 but M-015 reopened it; fix(P6) posted, awaiting verdict
 - [x] Gate 7 (P7) — PASSED, commit 499daf4, tag phase-7-done
-- [ ] Gate 8 (P8) — tagged phase-8-done
+- [x] Gate 8 (P8) — PASSED, commit d76b556 (fix(P8) race on Usage), tag phase-8-done; see G-027. Note: P8.2-P8.6 landed before the G-025 verdict (A10 continuation); disclosed in G-026.
 - [ ] Gate 9 (P9) — tagged phase-9-done
 - [ ] Gate 10 (P10) — tagged phase-10-done
 - [ ] Gate 11 (P11) — tagged phase-11-done
