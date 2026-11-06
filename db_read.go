@@ -1,7 +1,12 @@
 package semlsm
 
 import (
+	"encoding/json"
+	"errors"
+
 	"semlsm/internal/base"
+	"semlsm/internal/checkpoint"
+	"semlsm/internal/manifest"
 	"semlsm/internal/resolve"
 	"semlsm/internal/version"
 )
@@ -91,12 +96,18 @@ func (db *DB) GetAt(key []byte, s uint64) (Result, error) {
 // getAtState resolves one read against a pinned read state (B6).
 func (db *DB) getAtState(key []byte, s uint64, rs *readState) (Result, error) {
 	raw, value := db.rawLookup(key, s, rs)
-	entry := db.checkpointEntry(key, s, rs)
+	entry, hit := db.checkpointLookup(key, s, rs)
 	outcome := resolve.Resolve(s, raw, entry)
 	switch outcome {
 	case resolve.NotFound:
+		if hit != nil {
+			hit.rel()
+		}
 		return Result{Kind: ResultNotFound, Key: copyBytes(key)}, nil
 	case resolve.UseRaw:
+		if hit != nil {
+			hit.rel()
+		}
 		return Result{
 			Kind:      ResultExact,
 			Key:       copyBytes(key),
@@ -104,7 +115,7 @@ func (db *DB) getAtState(key []byte, s uint64, rs *readState) (Result, error) {
 			VersionTs: raw.Ts,
 		}, nil
 	case resolve.UseSummary:
-		info, err := db.checkpointInfoFor(key, entry)
+		info, err := db.checkpointInfoFor(key, entry, hit)
 		if err != nil {
 			return Result{}, err
 		}
@@ -114,6 +125,9 @@ func (db *DB) getAtState(key []byte, s uint64, rs *readState) (Result, error) {
 			Checkpoint: info,
 		}, nil
 	default:
+		if hit != nil {
+			hit.rel()
+		}
 		return Result{}, resolve.ErrInvariant(key, s, entry)
 	}
 }
@@ -181,16 +195,97 @@ func fileMayContain(f *version.FileMeta, key []byte) bool {
 	return base.CompareUser(smallest, key) <= 0 && base.CompareUser(largest, key) >= 0
 }
 
-// checkpointEntry returns the covering checkpoint entry for (key, s).
-// Until P7 the checkpoint index is empty, so this always reports not-found.
-func (db *DB) checkpointEntry(key []byte, s uint64, rs *readState) resolve.Entry {
-	return resolve.Entry{}
+// ckptHit carries the covering tuple ref and reader for lazy summary loads.
+type ckptHit struct {
+	ref    manifest.TupleRef
+	reader *checkpoint.Reader
+	rel    func()
 }
 
-// checkpointInfoFor builds the CheckpointInfo for a summarized read.
-// Implemented in P7.
-func (db *DB) checkpointInfoFor(key []byte, entry resolve.Entry) (*CheckpointInfo, error) {
-	return nil, errCheckpointsPending
+// checkpointLookup implements P7.3: for (K, S), walk the group's tuple refs
+// with TsFrom <= S, checking each tuple's key index; keep the entry with the
+// largest MinTs <= S.
+func (db *DB) checkpointLookup(key []byte, s uint64, rs *readState) (resolve.Entry, *ckptHit) {
+	group := string(base.GroupOf(key, db.opts.GroupDepth, db.opts.GroupDelimiter))
+	refs := rs.version.Ckpts.GroupRefs(group)
+	if len(refs) == 0 {
+		return resolve.Entry{}, nil
+	}
+	var best resolve.Entry
+	var hit *ckptHit
+	for _, loc := range refs {
+		ref := loc.Ref
+		if ref.TsFrom > s {
+			break // sorted by TsFrom
+		}
+		r, rel, err := db.ckptCache.Get(loc.FileNum)
+		if err != nil {
+			continue
+		}
+		ke, ok, lerr := r.LookupKey(ref.ID, key)
+		if lerr != nil || !ok {
+			rel()
+			continue
+		}
+		// B6: only entries with MinTs <= S are eligible; keep the one with
+		// the largest MinTs.
+		if ke.MinTs <= s && (!best.Found || ke.MinTs >= best.MinTs) {
+			if hit != nil {
+				hit.rel()
+			}
+			best = resolve.Entry{
+				Found:    true,
+				MinTs:    ke.MinTs,
+				MaxTs:    ke.MaxTs,
+				Count:    ke.Count,
+				LastKind: ke.LastKind,
+			}
+			hit = &ckptHit{ref: ref, reader: r, rel: rel}
+			continue
+		}
+		rel()
+	}
+	return best, hit
+}
+
+// checkpointEntry returns the covering checkpoint entry for (key, s).
+func (db *DB) checkpointEntry(key []byte, s uint64, rs *readState) resolve.Entry {
+	e, hit := db.checkpointLookup(key, s, rs)
+	if hit != nil {
+		hit.rel()
+	}
+	return e
+}
+
+// checkpointInfoFor builds the CheckpointInfo for a summarized read (P7.4):
+// the summary is read only when the outcome is UseSummary.
+func (db *DB) checkpointInfoFor(key []byte, entry resolve.Entry, hit *ckptHit) (*CheckpointInfo, error) {
+	if hit == nil {
+		return nil, errors.New("semlsm: no covering checkpoint")
+	}
+	meta, err := hit.reader.ReadMeta(hit.ref.ID)
+	if err != nil {
+		hit.rel()
+		return nil, err
+	}
+	info := &CheckpointInfo{
+		ID:               meta.ID,
+		Group:            meta.Group,
+		TsFrom:           meta.TsFrom,
+		TsTo:             meta.TsTo,
+		SourceCount:      meta.SourceCount,
+		SourceBytes:      meta.SourceBytes,
+		SourceCRC32:      meta.SourceCRC32,
+		KeyMinTs:         entry.MinTs,
+		KeyMaxTs:         entry.MaxTs,
+		KeyCount:         entry.Count,
+		ArchiveAvailable: meta.ArchiveFileNum != 0,
+	}
+	if sumJSON, err := hit.reader.ReadSummary(hit.ref.ID); err == nil && len(sumJSON) > 0 {
+		_ = json.Unmarshal(sumJSON, &info.Summary)
+	}
+	hit.rel()
+	return info, nil
 }
 
 func copyBytes(b []byte) []byte {

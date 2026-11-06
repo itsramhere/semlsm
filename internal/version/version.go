@@ -25,19 +25,55 @@ const (
 	BottomLevel = base.NumLevels - 1
 )
 
-// CkptIndex holds checkpoint file references (opaque until P7).
+// CkptIndex holds checkpoint file references and the per-group index (P7.2).
 type CkptIndex struct {
-	ByNum map[uint64]*manifest.CkptFile
+	ByNum   map[uint64]*manifest.CkptFile
+	ByGroup map[string][]TupleLoc // sorted by TsFrom
+}
+
+// TupleLoc locates one tuple: its .ckpt file number plus the manifest ref.
+type TupleLoc struct {
+	FileNum uint64
+	Ref     manifest.TupleRef
 }
 
 func (c *CkptIndex) clone() *CkptIndex {
 	if c == nil {
-		return &CkptIndex{ByNum: map[uint64]*manifest.CkptFile{}}
+		c = &CkptIndex{ByNum: map[uint64]*manifest.CkptFile{}}
 	}
 	out := &CkptIndex{ByNum: make(map[uint64]*manifest.CkptFile, len(c.ByNum))}
 	for k, v := range c.ByNum {
 		out.ByNum[k] = v
 	}
+	out.rebuildGroups()
+	return out
+}
+
+// rebuildGroups reconstructs the group index from ByNum. Each group's
+// tuple refs are sorted by TsFrom (P7.2).
+func (c *CkptIndex) rebuildGroups() {
+	c.ByGroup = make(map[string][]TupleLoc, len(c.ByNum))
+	for fileNum, cf := range c.ByNum {
+		for _, t := range cf.Tuples {
+			c.ByGroup[t.Group] = append(c.ByGroup[t.Group], TupleLoc{FileNum: fileNum, Ref: t})
+		}
+	}
+	for g := range c.ByGroup {
+		refs := c.ByGroup[g]
+		for i := 1; i < len(refs); i++ {
+			for j := i; j > 0 && refs[j].Ref.TsFrom < refs[j-1].Ref.TsFrom; j-- {
+				refs[j], refs[j-1] = refs[j-1], refs[j]
+			}
+		}
+		c.ByGroup[g] = refs
+	}
+}
+
+// GroupRefs returns a copy of the tuple locations for a group.
+func (c *CkptIndex) GroupRefs(group string) []TupleLoc {
+	refs := c.ByGroup[group]
+	out := make([]TupleLoc, len(refs))
+	copy(out, refs)
 	return out
 }
 
@@ -101,7 +137,7 @@ func NewVersionSet() *VersionSet {
 		live: map[uint64]*FileMeta{},
 		refs: map[uint64]int64{},
 	}
-	v := &Version{Ckpts: &CkptIndex{ByNum: map[uint64]*manifest.CkptFile{}}, vs: vs}
+	v := &Version{Ckpts: &CkptIndex{ByNum: map[uint64]*manifest.CkptFile{}, ByGroup: map[string][]TupleLoc{}}, vs: vs}
 	v.refs.Store(1)
 	vs.current = v
 	return vs
@@ -216,6 +252,7 @@ func (vs *VersionSet) Apply(e *manifest.Edit) (*Version, error) {
 		cf := e.AddCkpts[i]
 		newVersion.Ckpts.ByNum[cf.FileNum] = &cf
 	}
+	newVersion.Ckpts.rebuildGroups()
 
 	// Bookkeeping: monotone max of each counter (M-011 item 2). An edit built
 	// earlier must never roll back the allocator, the timestamp, or the WAL
@@ -270,6 +307,9 @@ func (vs *VersionSet) releaseVersionLocked(v *Version) {
 	for _, level := range v.Levels {
 		for _, fm := range level {
 			if fm.refs.Add(-1) == 0 {
+				if dbgTraceObsolete != nil {
+					dbgTraceObsolete(v, fm.Num)
+				}
 				vs.Obsolete = append(vs.Obsolete, manifest.DelFile{Level: fm.Level, Num: fm.Num})
 				delete(vs.live, fm.Num)
 				delete(vs.refs, fm.Num)
@@ -277,6 +317,9 @@ func (vs *VersionSet) releaseVersionLocked(v *Version) {
 		}
 	}
 }
+
+// dbgTraceObsolete is a test-only hook for obsolete tracing.
+var dbgTraceObsolete func(v *Version, num uint64)
 
 // TakeObsolete drains the obsolete list.
 func (vs *VersionSet) TakeObsolete() []manifest.DelFile {
@@ -344,4 +387,16 @@ func (vs *VersionSet) CurrentLogNum() uint64 {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	return vs.LogNum
+}
+
+// ExportedVersionRef is a read-only view for test tracing.
+type ExportedVersionRef struct {
+	V   *Version
+	Num uint64
+}
+
+// SetTraceObsolete installs a test-only trace hook for obsolete enqueues.
+// Nil disables it.
+func SetTraceObsolete(fn func(v *Version, num uint64)) {
+	dbgTraceObsolete = fn
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"semlsm/internal/base"
+	"semlsm/internal/checkpoint"
 	"semlsm/internal/compaction"
 	"semlsm/internal/failpoint"
 	"semlsm/internal/manifest"
@@ -81,9 +82,10 @@ func (rs *readState) release() {
 
 // commitReq is one write request flowing to the commit goroutine.
 type commitReq struct {
-	recs []base.Record // last-write-wins batch, ts assigned by the committer
-	done chan error
-	ts   uint64
+	recs  []base.Record // last-write-wins batch, ts assigned by the committer
+	done  chan error
+	ts    uint64
+	flush bool // rotate the active memtable and wait (Flush)
 }
 
 // DB is a SemLSM instance.
@@ -124,6 +126,7 @@ type DB struct {
 
 	blockCache *sstable.BlockCache
 	tableCache *sstable.TableCache
+	ckptCache  *checkpoint.CkptCache
 	obsolete   *version.ObsoleteDeleter
 
 	closed    atomic.Bool
@@ -325,6 +328,9 @@ func (db *DB) openRecover() error {
 		}
 		r.UseCache(num, db.blockCache)
 		return r, nil
+	})
+	db.ckptCache = checkpoint.NewCkptCache(db.opts.MaxOpenTables, func(num uint64) (*checkpoint.Reader, error) {
+		return checkpoint.OpenReader(db.opts.FS, filepath.Join(db.dir, ckptName(num)))
 	})
 	return nil
 }

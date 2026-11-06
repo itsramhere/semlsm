@@ -1,14 +1,10 @@
 package semlsm
 
 import (
-	"errors"
 	"sync/atomic"
 
 	"semlsm/internal/base"
 )
-
-// errCheckpointsPending is replaced in P7 when checkpoint lookup lands.
-var errCheckpointsPending = errors.New("semlsm: checkpoint lookups arrive in P7")
 
 // Summary is defined fully in P8; the empty type keeps the API shape.
 type Summary struct {

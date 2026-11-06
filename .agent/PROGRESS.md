@@ -161,7 +161,7 @@ Plan reference: SEMLSM_IMPLEMENTATION_PLAN.md (the spec). Phases end with a gate
 - [ ] Gate 3 (P3) — tagged phase-3-done
 - [x] Gate 4 (P4) — PASSED, commit 7533df9, tag phase-4-done
 - [x] Gate 5 (P5) — PASSED, commit f039828, tag phase-5-done
-- [ ] Gate 6 (P6) — tagged phase-6-done
+- [x] Gate 6 (P6) — PASSED, commit 97b3812, tag phase-6-done
 - [ ] Gate 7 (P7) — tagged phase-7-done
 - [ ] Gate 8 (P8) — tagged phase-8-done
 - [ ] Gate 9 (P9) — tagged phase-9-done

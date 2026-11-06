@@ -129,11 +129,12 @@ func (db *DB) flushOne(item immEntry, logNumToSet uint64) error {
 	return db.finishFlush(item, sstNum, &meta, false, logNumToSet, maxTs)
 }
 
-// finishFlush appends the manifest edit, installs the new version, and
-// removes the flushed memtable and its WAL (B7 order). logNumToSet (if > 0)
+// finishFlush appends the manifest edit and installs the new version, both
+// under manifestMu so the Apply->readState swap is atomic with respect to
+// other installers (concurrent installs could otherwise double-release the
+// readState's version ref and kill a pinned version). logNumToSet (if > 0)
 // advances log_num past WALs whose data is fully durable in the SST.
 func (db *DB) finishFlush(item immEntry, sstNum uint64, meta *manifest.FileMeta, empty bool, logNumToSet uint64, itemMaxTs uint64) error {
-	// manifest edit under manifestMu (M-013 item 1a: one stamped helper)
 	db.manifestMu.Lock()
 	e := &manifest.Edit{}
 	if !empty {
@@ -146,14 +147,10 @@ func (db *DB) finishFlush(item immEntry, sstNum uint64, meta *manifest.FileMeta,
 		db.manifestMu.Unlock()
 		return fmt.Errorf("semlsm: flush manifest: %w", err)
 	}
-	db.manifestMu.Unlock()
 
-	if err := failpoint.Hit(fpFlushAfterManifest); err != nil {
-		return err
-	}
-
-	// install under mu: remove the memtable, swap the version (B7: the
-	// readState is immutable once built, so build a fresh one)
+	// install under mu (nested inside manifestMu; lock order manifestMu->mu):
+	// remove the memtable, swap the version (B7: the readState is immutable
+	// once built, so build a fresh one)
 	db.mu.Lock()
 	newVersion := db.vs.Acquire()
 	if db.rs != nil {
@@ -169,6 +166,11 @@ func (db *DB) finishFlush(item immEntry, sstNum uint64, meta *manifest.FileMeta,
 		db.stallCond.Broadcast()
 	}
 	db.mu.Unlock()
+	db.manifestMu.Unlock()
+
+	if err := failpoint.Hit(fpFlushAfterManifest); err != nil {
+		return err
+	}
 
 	// close and delete the old WAL (best effort; I6)
 	if item.wal != nil {

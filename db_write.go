@@ -1,6 +1,7 @@
 package semlsm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -189,6 +190,14 @@ func (db *DB) commitGroup(group []*commitReq) {
 		db.mu.Lock()
 		db.visibleTs = ts
 		db.mu.Unlock()
+		if group[0].flush {
+			// Flush: rotate so the active memtable reaches L0
+			if err := db.rotate(); err != nil {
+				db.setFailed(err)
+				group[0].done <- err
+				return
+			}
+		}
 		group[0].done <- nil
 		return
 	}
@@ -256,6 +265,22 @@ func (db *DB) commitGroup(group []*commitReq) {
 
 	// Rotate if the memtable exceeds its budget.
 	if db.mem.ApproxBytes() >= db.opts.MemtableBytes {
+		if err := db.rotate(); err != nil {
+			db.setFailed(err)
+			db.completeGroup(group, err)
+			return
+		}
+	}
+
+	// Explicit flush requests: rotate the now-current memtable so its data
+	// reaches L0 (Flush).
+	anyFlush := false
+	for _, req := range group {
+		if req.flush {
+			anyFlush = true
+		}
+	}
+	if anyFlush {
 		if err := db.rotate(); err != nil {
 			db.setFailed(err)
 			db.completeGroup(group, err)
@@ -335,4 +360,23 @@ func (db *DB) wakeFlush() {
 	case db.flushWake <- struct{}{}:
 	default:
 	}
+}
+
+// Flush rotates the active memtable and waits for it to reach L0 (B5).
+func (db *DB) Flush() error {
+	if db.closed.Load() {
+		return ErrClosed
+	}
+	req := &commitReq{done: make(chan error, 1), flush: true}
+	select {
+	case db.commitQ <- req:
+	case <-db.closeCh:
+		return ErrClosed
+	}
+	if err := <-req.done; err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return db.WaitIdle(ctx)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"semlsm/internal/base"
@@ -126,6 +127,12 @@ func (db *DB) busySnapshotLocked() map[uint64]bool {
 // runStructural merges plan inputs into OutputLevel with an atomic manifest
 // edit (P6.2). All versions and tombstones are retained.
 func (db *DB) runStructural(plan *compaction.Plan) error {
+	if dbgLogCompaction != nil {
+		buf := make([]byte, 2000)
+		n := runtime.Stack(buf, false)
+		dbgLogCompaction(fmt.Sprintf("runStructural L%d->L%d inputs=%d\n%s",
+			plan.Level, plan.OutputLevel, len(plan.Inputs), buf[:n]))
+	}
 	v := db.vs.Acquire()
 	defer v.Unref()
 
@@ -213,13 +220,10 @@ func (db *DB) runStructural(plan *compaction.Plan) error {
 		ow.Abort()
 		return fmt.Errorf("semlsm: compact manifest: %w", err)
 	}
-	db.manifestMu.Unlock()
 
-	if err := failpoint.Hit(fpCompactAfterManifest); err != nil {
-		return err
-	}
-
-	// Install under mu (B7): fresh readState with the new version.
+	// Install under mu nested inside manifestMu (B7): the Apply->readState
+	// swap is atomic with respect to other installers, so the readState's
+	// version ref is released exactly once.
 	db.mu.Lock()
 	newVersion := db.vs.Acquire()
 	if db.rs != nil {
@@ -229,28 +233,16 @@ func (db *DB) runStructural(plan *compaction.Plan) error {
 		db.stallCond.Broadcast()
 	}
 	db.mu.Unlock()
+	db.manifestMu.Unlock()
 
-	// Obsolete files: versions drop to zero when readers release.
-	for _, f := range files {
-		db.enqueueObsolete(f)
+	if err := failpoint.Hit(fpCompactAfterManifest); err != nil {
+		return err
 	}
+
+	// Obsolete deletion is driven by version death (drainObsolete); a
+	// snapshot pinning this version keeps its files alive.
+	db.drainObsolete()
 	return nil
-}
-
-// enqueueObsolete schedules a file for deletion once versions release it.
-func (db *DB) enqueueObsolete(f *version.FileMeta) {
-	if db.obsolete == nil {
-		return
-	}
-	suffix := ".sst"
-	if f.IsCkpt() {
-		suffix = ".ckpt"
-	}
-	db.obsolete.Enqueue(version.ObsoleteFile{
-		Path:   filepath.Join(db.dir, fmt.Sprintf("%06d%s", f.Num, suffix)),
-		Num:    f.Num,
-		IsCkpt: f.IsCkpt(),
-	})
 }
 
 // WaitIdle blocks until all flush and compaction queues are drained (B5/P6.3,
@@ -336,3 +328,68 @@ func (db *DB) drainObsolete() {
 		})
 	}
 }
+
+// VerifyReport summarizes an integrity check (P7.5 minimal form; P11.3
+// extends it with archive CRC and tuple-chain validation).
+type VerifyReport struct {
+	SSTFiles  int
+	CkptFiles int
+	Tuples    int
+	Entries   int
+	Problems  []string
+}
+
+// VerifyIntegrity reads every block of every SST and every section of every
+// checkpoint referenced by the current version. Any CRC or structural
+// failure is reported; it never returns wrong data silently (I12).
+func (db *DB) VerifyIntegrity(ctx context.Context) (VerifyReport, error) {
+	rep := VerifyReport{}
+	v := db.vs.Acquire()
+	defer v.Unref()
+	for l := range v.Levels {
+		for _, f := range v.Levels[l] {
+			r, rel, err := db.tableCache.Get(f.Num)
+			if err != nil {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("sst %d: open: %v", f.Num, err))
+				continue
+			}
+			it := r.NewIterator()
+			for it.First(); it.Valid(); it.Next() {
+				rep.Entries++
+			}
+			if e := it.Err(); e != nil {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("sst %d: iterate: %v", f.Num, e))
+			}
+			it.Close()
+			rel()
+			rep.SSTFiles++
+		}
+	}
+	for num := range v.Ckpts.ByNum {
+		r, rel, err := db.ckptCache.Get(num)
+		if err != nil {
+			rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d: open: %v", num, err))
+			continue
+		}
+		for _, t := range r.Tuples() {
+			rep.Tuples++
+			keys, err := r.IterKeys(t.ID)
+			if err != nil {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d tuple %d: index: %v", num, t.ID, err))
+				continue
+			}
+			for range keys {
+				rep.Entries++
+			}
+			if _, err := r.ReadSummary(t.ID); err != nil {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d tuple %d: summary: %v", num, t.ID, err))
+			}
+		}
+		rel()
+		rep.CkptFiles++
+	}
+	return rep, nil
+}
+
+// dbgLogCompaction is a temporary test hook for compaction tracing.
+var dbgLogCompaction func(msg string)
