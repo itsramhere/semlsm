@@ -33,6 +33,13 @@ func (u *Usage) add(r llm.Response) {
 	u.Calls++
 }
 
+// merge folds one call's usage delta into the total.
+func (u *Usage) merge(o Usage) {
+	u.InputTokens += o.InputTokens
+	u.OutputTokens += o.OutputTokens
+	u.Calls += o.Calls
+}
+
 // Summarizer runs the map-reduce summarization pipeline over one segment
 // (P8.6). Every response is validated (P8.5); on a ValidationError there is
 // exactly one repair retry, then the segment fails. The client is usually
@@ -81,7 +88,8 @@ func (s *Summarizer) Summarize(ctx context.Context, seg Segment, group string) (
 
 	var final Narrative
 	if len(chunks) == 1 {
-		n, err := s.mapCall(ctx, group, 1, 1, chunks[0], ids, &usage)
+		n, du, err := s.mapCall(ctx, group, 1, 1, chunks[0], ids)
+		usage.merge(du)
 		if err != nil {
 			return Summary{}, usage, err
 		}
@@ -104,9 +112,10 @@ func (s *Summarizer) Summarize(ctx context.Context, seg Segment, group string) (
 				case <-opCtx.Done():
 					return
 				}
-				n, err := s.mapCall(opCtx, group, i+1, len(chunks), chunks[i], ids, &usage)
+				n, du, err := s.mapCall(opCtx, group, i+1, len(chunks), chunks[i], ids)
 				mu.Lock()
 				defer mu.Unlock()
+				usage.merge(du)
 				if err != nil {
 					if firstErr == nil {
 						firstErr = err
@@ -127,7 +136,8 @@ func (s *Summarizer) Summarize(ctx context.Context, seg Segment, group string) (
 			next := make([]Narrative, 0, (len(round)+reduceFanIn-1)/reduceFanIn)
 			for start := 0; start < len(round); start += reduceFanIn {
 				end := min(start+reduceFanIn, len(round))
-				n, err := s.reduceCall(ctx, group, round[start:end], &usage)
+				n, du, err := s.reduceCall(ctx, group, round[start:end])
+				usage.merge(du)
 				if err != nil {
 					return Summary{}, usage, err
 				}
@@ -153,7 +163,9 @@ func (s *Summarizer) Summarize(ctx context.Context, seg Segment, group string) (
 }
 
 // mapCall summarizes one chunk, with one repair retry on ValidationError.
-func (s *Summarizer) mapCall(ctx context.Context, group string, index, total int, c Chunk, ids map[string]bool, usage *Usage) (Narrative, error) {
+// It returns the usage this call consumed; callers merge it, so the shared
+// Usage is never written concurrently.
+func (s *Summarizer) mapCall(ctx context.Context, group string, index, total int, c Chunk, ids map[string]bool) (Narrative, Usage, error) {
 	req := llm.Request{
 		System:          SystemPrompt(),
 		User:            BuildUserPrompt(group, index, total, c),
@@ -164,18 +176,18 @@ func (s *Summarizer) mapCall(ctx context.Context, group string, index, total int
 			"group":          group,
 		},
 	}
-	return s.callAndValidate(ctx, req, ids, usage)
+	return s.callAndValidate(ctx, req, ids)
 }
 
 // reduceCall merges up to reduceFanIn partial summaries. The valid ids are
 // the union of the input summaries' refs (P8.6).
-func (s *Summarizer) reduceCall(ctx context.Context, group string, parts []Narrative, usage *Usage) (Narrative, error) {
+func (s *Summarizer) reduceCall(ctx context.Context, group string, parts []Narrative) (Narrative, Usage, error) {
 	valid := map[string]bool{}
 	jsons := make([]string, len(parts))
 	for i, p := range parts {
 		data, err := NarrativeJSON(p)
 		if err != nil {
-			return Narrative{}, err
+			return Narrative{}, Usage{}, err
 		}
 		jsons[i] = string(data)
 		for _, f := range p.KeyFacts {
@@ -199,33 +211,36 @@ func (s *Summarizer) reduceCall(ctx context.Context, group string, parts []Narra
 			"group":          group,
 		},
 	}
-	return s.callAndValidate(ctx, req, valid, usage)
+	return s.callAndValidate(ctx, req, valid)
 }
 
 // callAndValidate runs one LLM call, validates the response, and retries
-// once with the repair instruction appended to the user prompt (P8.6).
-func (s *Summarizer) callAndValidate(ctx context.Context, req llm.Request, ids map[string]bool, usage *Usage) (Narrative, error) {
+// once with the repair instruction appended to the user prompt (P8.6). The
+// returned Usage is the delta this call consumed; callers merge it, so the
+// shared Usage is never written concurrently.
+func (s *Summarizer) callAndValidate(ctx context.Context, req llm.Request, ids map[string]bool) (Narrative, Usage, error) {
+	var u Usage
 	resp, err := s.Client.Complete(ctx, req)
 	if err != nil {
-		return Narrative{}, err
+		return Narrative{}, u, err
 	}
-	usage.add(resp)
+	u.add(resp)
 	n, verr := ParseAndValidate(resp.Text, ids)
 	if verr == nil {
-		return n, nil
+		return n, u, nil
 	}
 	repair := req
 	repair.User = req.User + "\nYour previous output was invalid: " + verr.Error() + ". Return only corrected JSON."
 	resp2, err := s.Client.Complete(ctx, repair)
 	if err != nil {
-		return Narrative{}, err
+		return Narrative{}, u, err
 	}
-	usage.add(resp2)
+	u.add(resp2)
 	n, verr = ParseAndValidate(resp2.Text, ids)
 	if verr != nil {
-		return Narrative{}, verr
+		return Narrative{}, u, verr
 	}
-	return n, nil
+	return n, u, nil
 }
 
 // resolveRefs maps every cited record id to (key, ts) on the final
