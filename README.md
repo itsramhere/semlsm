@@ -73,10 +73,21 @@ go run ./cmd/semlsm-demo                    # 100k telemetry records, >= 10x red
 ```
 
 The demo prints the before/after sizes and demonstrates an Exact read, a
-Summarized read, a pinned-snapshot read, and exact anomaly recovery from the
-archive tier. Measured on the development machine (Windows, in-memory FS):
-173.8x reduction of the summarized range at 100k records; read latencies are
-in the microsecond range (see `bench-results/*.json`).
+Summarized read, a pinned-snapshot read of the SAME mid-range timestamp
+(still Exact while the live read is Summarized — I9), and exact anomaly
+recovery from the archive tier. Measured on the development machine
+(Windows, in-memory FS) at 100k records: **174x reduction of the summarized
+range** — with the deterministic mock, whose summaries are fixed-size; a
+real LLM writes larger summaries, so the live-LLM ratio will be lower and
+stays unmeasured until the optional P15 run. The mock's summary text
+("mock summary of 3 records") is canned; the tuple's real numbers
+(999 versions covered) are engine-computed.
+
+Store sizes are reported honestly: the whole store does NOT shrink by the
+summarization ratio — the archive tier intentionally keeps every dropped
+raw record (recoverability), and checkpoint files add fixed overhead. The
+demo prints the live store and the archive separately; the live store
+(1.28 MB raw → 117 KB) is where the compaction wins live.
 
 ## Guarantees
 

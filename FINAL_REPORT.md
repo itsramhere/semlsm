@@ -39,20 +39,41 @@ integrity problems.
 ## P14 numbers (honest, no tuning)
 
 - **Demo** (`cmd/semlsm-demo`, 100 agents × 1000 telemetry versions =
-  100 000 records, deterministic mock LLM): raw record bytes 9 978 990;
-  summarized raw bytes 2 989 764 → summary bytes 17 201 = **173.8x
-  reduction** of the summarized range (29 970 records summarized). The demo
-  prints an Exact latest read, a Summarized mid-range read, a pinned
-  snapshot read, and recovers planted anomalies exactly from the archive
-  tier (`GetArchived`); it exits 1 below 10x.
+  100 000 records, deterministic mock LLM): the full aged range is
+  summarized — 99 900 records, raw 9 969 000 bytes → summary 57 305 bytes =
+  **174.0x reduction of the summarized range**. Per M-033, stated plainly:
+  this ratio is measured **with the deterministic mock, whose summaries are
+  fixed-size (~170 B) whatever the input** — a real LLM writes larger
+  summaries, so the live-LLM ratio will be lower and is unmeasured until
+  the optional P15 run. The mock's summary text ("mock summary of 3
+  records") is canned — the mock cites the first 3 record ids in the
+  prompt; the tuple's real numbers (999 versions covered, SourceCount 999)
+  are engine-computed.
+  Whole-store sizes, also per M-033: on-disk before (raw) 1 276 520;
+  after: live store 117 071 (10 head SSTs 5 356 + 100 ckpt files 86 287 +
+  manifest/other 25 380) **plus** archive tier 1 289 480 (the dropped raw
+  records, kept recoverable by design). The whole store is therefore
+  slightly LARGER than before: the archive intentionally keeps every
+  dropped raw record and checkpoint files add fixed overhead; the
+  compaction win is in the live store (1.28 MB → 117 KB, ~11x) and would
+  grow with real summaries' sizes. Without `ArchiveRaw` the dropped
+  records are gone and the store shrinks accordingly.
+  The demo prints an Exact latest read, a Summarized mid-range read, and a
+  pinned-snapshot read of the SAME mid-range ts (still Exact with the
+  original value while the live read is Summarized — the I9 point), and
+  recovers planted anomalies exactly via `GetArchived` (3/3); it exits 1
+  below 10x.
 - **Bench** (`cmd/semlsm-bench`, 20 000 records/phase, in-memory FS):
   get-latest p50 ≈ 0.5–0.9 µs, p99 ≈ 2–4 µs; historical reads similar;
   write throughput ≈ 750–1200 MB/s (batch spans; see below); on-disk size
-  384 KB (semantic off) vs 25–38 KB (semantic on, compacted). NOTE: this
-  Windows box's monotonic clock resolves only ~1 ms spans, so batch spans
-  shorter than that report as 0 ns; per-op numbers below the clock floor
-  are not measurable here and are reported as 0 rather than invented.
-  Reports land in `bench-results/*.json` (git-ignored).
+  384 KB (semantic off) vs 25–38 KB (semantic on, compacted). Both bench
+  numbers count the whole db dir with `ArchiveRaw` OFF (no archive) — the
+  off phase runs no compaction, so its 384 KB is post-write raw; the on
+  phase compacts before measuring. NOTE: this Windows box's monotonic
+  clock resolves only ~1 ms spans, so batch spans shorter than that report
+  as 0 ns; per-op numbers below the clock floor are not measurable here
+  and are reported as 0 rather than invented. Reports land in
+  `bench-results/*.json` (git-ignored).
 
 ## Bugs found and fixed during P9–P14 (all caught by the gated tests)
 
