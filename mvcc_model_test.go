@@ -542,3 +542,59 @@ func probeDBAfterReopen(t *testing.T, db *DB, model *testmodel.Model, versions m
 		t.Fatalf("reopen key %q@%d: B6 says Invariant", key, s)
 	}
 }
+
+// TestIteratorGroupBoundBelowDelimiter ports the supervisor's iterator test
+// (M-029, optional but permanent here): a key whose group sorts just below
+// the group of End (a byte under the delimiter, '-' vs '/') is still inside
+// [Start, End), so its tuple must not be filtered out of the iterator.
+func TestIteratorGroupBoundBelowDelimiter(t *testing.T) {
+	db, clk, _ := openSemDB(t, "db", llm.NewMock(llm.MockValid), nil)
+	defer db.Close()
+	key := []byte("agent/1-x/state") // group "agent/1-x/" > "agent/1"
+	var tss []uint64
+	for i := 0; i < 200; i++ {
+		ts, err := db.Put(key, []byte(fmt.Sprintf("v%03d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tss = append(tss, ts)
+	}
+	driveDown(t, db)
+	clk.Set(semStart.Add(5 * time.Hour))
+	if err := db.CompactLevel(context.Background(), 4); err != nil {
+		t.Fatal(err)
+	}
+	if db.Stats().SemanticTuplesCreated == 0 {
+		t.Skip("no tuple")
+	}
+	mid := tss[100]
+	want, err := db.GetAt(key, mid)
+	if err != nil || want.Kind != ResultSummarized {
+		t.Fatalf("GetAt mid: kind=%d err=%v", want.Kind, err)
+	}
+	snap, err := db.OpenSnapshotAt(mid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Release()
+	for _, end := range [][]byte{[]byte("agent/1/zzz"), nil} {
+		it := snap.NewIterator(IterOptions{Start: []byte("agent/"), End: end})
+		found := false
+		for it.Next() {
+			r := it.Result()
+			if string(r.Key) == string(key) {
+				found = true
+				if r.Kind != ResultSummarized {
+					t.Errorf("end=%q: iterator kind=%d, GetAt says Summarized", end, r.Kind)
+				}
+			}
+		}
+		if err := it.Err(); err != nil {
+			t.Fatal(err)
+		}
+		it.Close()
+		if !found {
+			t.Errorf("end=%q: key %q inside the range but missing from iterator (GetAt=Summarized)", end, key)
+		}
+	}
+}
