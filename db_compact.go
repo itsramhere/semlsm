@@ -915,8 +915,13 @@ func (db *DB) semanticDeps() compaction.SemanticDeps {
 	}
 }
 
-// prevTupleID returns the newest existing tuple id of the group from the
-// current Version — the PrevTupleID chain head (P10.1). 0 when none.
+// prevTupleID returns the most recently created tuple id of the group from
+// the current Version — the PrevTupleID chain head (P10.1). 0 when none.
+// "Newest" means newest created (largest id; ids come from the monotonic
+// file allocator), not largest TsFrom: a deep job can drop an older range
+// after a sweep dropped a newer one, so insertion order and ts order differ
+// and the last-by-TsFrom tuple would be handed out twice (found by the
+// P13.4 soak).
 func (db *DB) prevTupleID(group string) uint64 {
 	v := db.vs.Acquire()
 	defer v.Unref()
@@ -924,7 +929,13 @@ func (db *DB) prevTupleID(group string) uint64 {
 	if len(refs) == 0 {
 		return 0
 	}
-	return refs[len(refs)-1].Ref.ID // sorted by TsFrom; the last is newest
+	best := refs[0].Ref.ID
+	for _, loc := range refs[1:] {
+		if loc.Ref.ID > best {
+			best = loc.Ref.ID
+		}
+	}
+	return best
 }
 
 // runSemantic drives one Tier B job through P10.1's order: the size guard

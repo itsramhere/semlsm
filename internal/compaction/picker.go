@@ -19,6 +19,7 @@ type Picker struct {
 	LevelMultiplier  int
 	TargetFileBytes  int64
 	cursors          [base.NumLevels]uint64 // round-robin per input level
+	fastParity       bool                   // alternates L0/L1 when both are over target
 }
 
 // NewPicker builds a picker.
@@ -67,14 +68,33 @@ func (pl *Plan) AllFiles() []*version.FileMeta {
 
 // PickFast returns a plan for L0->L1 or L1->L2 when either scores >= 1,
 // or nil. busy holds file numbers already used by running compactions.
+// When both levels are over target the worker alternates between them:
+// strict L0-first lets continuous L0 traffic starve L1->L2 (the growing L1
+// gets rewritten forever and L2 never sees data — found by the P13
+// hardening work).
 func (p *Picker) PickFast(v *version.Version, busy map[uint64]bool) *Plan {
 	scores := p.Score(v)
-	if scores[0] >= 1 {
+	l0 := scores[0] >= 1
+	l1 := scores[1] >= 1
+	if l0 && l1 {
+		p.fastParity = !p.fastParity
+		if p.fastParity {
+			if pl := p.planLevel(v, 1, busy); pl != nil {
+				return pl
+			}
+			return p.planL0(v, busy)
+		}
+		if pl := p.planL0(v, busy); pl != nil {
+			return pl
+		}
+		return p.planLevel(v, 1, busy)
+	}
+	if l0 {
 		if pl := p.planL0(v, busy); pl != nil {
 			return pl
 		}
 	}
-	if scores[1] >= 1 {
+	if l1 {
 		if pl := p.planLevel(v, 1, busy); pl != nil {
 			return pl
 		}

@@ -35,6 +35,7 @@ func testOptions(fs vfs.FS, clock base.Clock) Options {
 
 func openTestDB(t *testing.T, dir string) *DB {
 	t.Helper()
+	t.Cleanup(func() { awaitGoroutineSettle(t) }) // P13.5
 	fs := vfs.NewMemFS()
 	db, err := Open(dir, testOptions(fs, base.RealClock{}))
 	if err != nil {
@@ -442,9 +443,13 @@ func TestMemFSCrashMatrix(t *testing.T) {
 				model.Commit(b.recs[i : i+1])
 			}
 			if i == crashAt {
-				break // crash: abandon the live DB without Close
+				break // crash: abandon the workload, the clone captures the state
 			}
 		}
+		// The crash is the test's fiction: the in-process DB still runs.
+		// Stop its workers now (the clone is filesystem-level and Close
+		// does not touch it), or the P13.5 leak check flags them.
+		_ = db.Close()
 
 		for _, mode := range []vfs.CrashMode{vfs.DropUnsynced, vfs.TornTail} {
 			var after *vfs.MemFS

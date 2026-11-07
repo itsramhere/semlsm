@@ -448,6 +448,13 @@ func (db *DB) loadOrCreateManifest() error {
 	db.vs = version.NewVersionSet()
 	currentName, err := manifest.ReadCurrent(db.opts.FS, db.dir)
 	if err == nil {
+		mf, merr := db.opts.FS.Open(filepath.Join(db.dir, currentName))
+		if merr != nil {
+			// CURRENT names a manifest that cannot be opened: corrupted
+			// pointer (I12) — never a wrong answer, report corruption.
+			return fmt.Errorf("semlsm: manifest %s: %w: %v", currentName, ErrCorruption, merr)
+		}
+		mf.Close()
 		edits, rerr := manifest.ReadAll(db.opts.FS, filepath.Join(db.dir, currentName))
 		if rerr != nil {
 			return fmt.Errorf("semlsm: manifest %s: %w", currentName, rerr)
@@ -762,6 +769,9 @@ func (db *DB) Close() error {
 		// close cached readers
 		if db.tableCache != nil {
 			db.tableCache.CloseAll()
+		}
+		if db.ckptCache != nil {
+			db.ckptCache.CloseAll()
 		}
 		// release read state
 		db.mu.Lock()
