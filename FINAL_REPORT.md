@@ -110,10 +110,10 @@ integrity problems.
   break the public `Options.Clock` contract (R8).
 - `Limiter.Wait` pairs with `Release()` so the stack can hold a concurrency
   slot across the upstream call.
-- Archives live outside the manifest (the B8 manifest format has no archive
-  field): referenced via `TupleMeta.ArchiveFileNum`, orphan-swept at Open,
-  deleted with their checkpoint. Checkpoint files accumulate one per
-  semantic job (no tuple GC).
+- Archives remain referenced by `TupleMeta.ArchiveFileNum`; the additive
+  manifest `archive_nums` field now also records the set for each checkpoint.
+  Legacy records fall back to checked tuple reads. Background and manual
+  merges combine checkpoint files without changing tuples.
 - `PickFast` alternates L0 and L1 when both are over target (starvation
   fix; the plan mandates "either scores >= 1", not a fixed priority).
 - `GetArchived` delegates to `GetAt` for ts above the key's dropped run
@@ -123,19 +123,30 @@ integrity problems.
 
 ## Known limitations
 
-- **Manifest torn tail rolls back silently**: a corrupted final manifest
-  frame is treated as a torn write per the plan's WAL-like rule; the last
-  committed edit (e.g. a whole semantic job) rolls back to the previous
-  state and the next Open sweeps its files as orphans. No wrong answer is
-  ever served, but the rollback is silent. A stricter variant — treat a
-  full-length final frame with a bad CRC as `ErrCorruption` and tolerate
-  only short frames — was noted for the supervisor in M-032 and is not
-  implemented (it would change recovery semantics the plan fixes).
-- Checkpoint files accumulate (no tuple GC); archive segments from an
-  unreadable dying checkpoint leak until the next Open sweep can read the
-  live ckpts.
-- The soak's Windows handle check runs only where the OS FS is used
-  (`cmd` tests, soak); in-memory tests rely on the goroutine-settle check.
+Briefs A and B address all four listed implementation limitations. Complete
+CRC-broken tails require explicit Repair; archive metadata and all-version
+liveness protect deletion; MemFS tests check handles; checkpoint merges bound
+file count. Final verification: `gofmt -l .` is empty, `go vet ./...` is clean,
+and `go test -count=1 -race -timeout 900s ./...` passes every package (root
+249.175s). File changes and design details are reported in the final
+conversation message.
+
+- Real-disk non-prefix tears (for example sector reordering) surface as
+  `ErrCorruption` when a complete frame fails CRC. Explicit `Repair` can
+  discard only the damaged final manifest/newest eligible WAL frame and
+  quarantines unreferenced data files in `lost+found/`. Prefix tears remain
+  tolerated; complete final CRC damage no longer rolls back silently.
+- Checkpoint merging now bounds file count (default threshold 32; configurable
+  or manually triggered). Tuples and summaries are retained byte-for-byte;
+  tuple retention / dropping old summaries is still not implemented.
+  Archive deletion uses the dying version's retained manifest archive
+  numbers and preserves archives referenced by any live version. An
+  unreadable legacy checkpoint without archive metadata still requires a
+  fallback read; if its live archive set is unknown, Open logs and skips all
+  archive deletion rather than risking data loss.
+- MemFS now exposes open handle counts and sorted names, and root/internal
+  test fixtures check for leaked handles after use. Crash clones inherit
+  neither handles nor locks. This complements the existing Windows checks.
 - P15 (live LLM smoke) was not run: no API key in the environment. The
   engine has never talked to a real endpoint; the HTTP client is
   httptest-tested only.

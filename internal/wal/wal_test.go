@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"semlsm/internal/base"
+	"semlsm/internal/testutil"
 	"semlsm/internal/vfs"
 )
 
@@ -26,7 +27,7 @@ func rec(key string, ts uint64, k base.Kind, val string) base.Record {
 // writeWALFile builds a fresh MemFS holding one WAL with the given payloads.
 func writeWALFile(t *testing.T, payloads ...[]byte) *vfs.MemFS {
 	t.Helper()
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, err := NewWriter(fs, "wal")
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +50,7 @@ func writeWALFile(t *testing.T, payloads ...[]byte) *vfs.MemFS {
 func truncateCopy(t *testing.T, src *vfs.MemFS, n int64) *vfs.MemFS {
 	t.Helper()
 	full := readAllWAL(t, src, "wal")
-	dst := vfs.NewMemFS()
+	dst := testutil.NewMemFS(t)
 	f, err := dst.Create("wal")
 	if err != nil {
 		t.Fatal(err)
@@ -252,7 +253,7 @@ func TestWALCleanEndBothModes(t *testing.T) {
 	}
 
 	// Empty file: clean end in both modes.
-	empty := vfs.NewMemFS()
+	empty := testutil.NewMemFS(t)
 	f, _ := empty.Create("wal")
 	f.Close()
 	for _, last := range []bool{true, false} {
@@ -267,7 +268,7 @@ func TestWALZeroFilledTail(t *testing.T) {
 	// One real frame followed by a zero-filled crash tail: the zero bytes
 	// must parse as torn/corrupt, not as empty frames (M-006 item 2).
 	p1 := encodeBatch(t, 1, []base.Record{rec("a", 1, base.KindPut, "v1")})
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	f, _ := fs.Create("wal")
 	f.Write(readAllWAL(t, writeWALFile(t, p1), "wal"))
 	f.Write(make([]byte, 32))
@@ -288,7 +289,7 @@ func TestWALZeroFilledTail(t *testing.T) {
 }
 
 func TestWALAppendRejectsEmptyPayload(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, err := NewWriter(fs, "wal")
 	if err != nil {
 		t.Fatal(err)
@@ -344,7 +345,7 @@ func TestWALFlippedByte(t *testing.T) {
 	corrupt := append([]byte(nil), full...)
 	corrupt[start2+frameHeaderLen+2] ^= 0x01
 
-	dst := vfs.NewMemFS()
+	dst := testutil.NewMemFS(t)
 	f, _ := dst.Create("wal")
 	f.Write(corrupt)
 	f.Close()
@@ -354,8 +355,8 @@ func TestWALFlippedByte(t *testing.T) {
 	}
 	var n int
 	valid, err := Replay(dst, "wal", true, func(p []byte) error { n++; return nil })
-	if err != nil || n != 1 || valid != start2 {
-		t.Fatalf("last: n=%d valid=%d err=%v, want torn tail after frame 1", n, valid, err)
+	if !errors.Is(err, base.ErrCorruption) || n != 1 || valid != start2 {
+		t.Fatalf("last: n=%d valid=%d err=%v, want ErrCorruption after frame 1", n, valid, err)
 	}
 }
 
@@ -391,7 +392,7 @@ func TestWALOversizedLengthFieldDoesNotAllocate(t *testing.T) {
 		header := make([]byte, frameHeaderLen)
 		binary.LittleEndian.PutUint32(header[0:4], length)
 		binary.LittleEndian.PutUint32(header[4:8], 0xDEADBEEF)
-		fs := vfs.NewMemFS()
+		fs := testutil.NewMemFS(t)
 		f, _ := fs.Create("wal")
 		f.Write(header)
 		f.Write([]byte("tiny trailing bytes"))
@@ -412,7 +413,7 @@ func TestWALOversizedLengthFieldDoesNotAllocate(t *testing.T) {
 }
 
 func TestWriterSizeAccounting(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, err := NewWriter(fs, "wal")
 	if err != nil {
 		t.Fatal(err)
@@ -465,7 +466,7 @@ func TestReplayStrict(t *testing.T) {
 	// bad CRC in a NON-final frame with bytes after it: ErrCorruption
 	corrupt := append([]byte(nil), full...)
 	corrupt[start2+frameHeaderLen+2] ^= 0x01
-	cfs := vfs.NewMemFS()
+	cfs := testutil.NewMemFS(t)
 	fc, _ := cfs.Create("wal")
 	fc.Write(corrupt)
 	fc.Close()
@@ -482,7 +483,7 @@ func TestReplayStrict(t *testing.T) {
 	}
 
 	// zero-filled tail: torn, earlier frames survive
-	zfs := vfs.NewMemFS()
+	zfs := testutil.NewMemFS(t)
 	fz, _ := zfs.Create("wal")
 	fz.Write(full[:start3])
 	fz.Write(make([]byte, 64))
@@ -492,7 +493,7 @@ func TestReplayStrict(t *testing.T) {
 	}
 
 	// zero-length frame with non-zero garbage after: ErrCorruption
-	gfs := vfs.NewMemFS()
+	gfs := testutil.NewMemFS(t)
 	fg, _ := gfs.Create("wal")
 	fg.Write(full[:start3])
 	fg.Write(make([]byte, 8)) // zero-length frame header
@@ -517,7 +518,7 @@ func TestReplayStrictFlippedLengthBytes(t *testing.T) {
 	corruptAt := func(off int64) *vfs.MemFS {
 		c := append([]byte(nil), full...)
 		c[off] ^= 0x01
-		cfs := vfs.NewMemFS()
+		cfs := testutil.NewMemFS(t)
 		f, _ := cfs.Create("wal")
 		f.Write(c)
 		f.Close()
@@ -543,9 +544,9 @@ func TestReplayStrictFlippedLengthBytes(t *testing.T) {
 		}
 	}
 	// a bit flip in the final frame's LAST PAYLOAD byte fails the CRC with
-	// the frame ending exactly at EOF: torn tail, tolerated
+	// the frame ending exactly at EOF: damage, reported as corruption
 	payloadFlip := corruptAt(int64(len(full)) - 1)
-	if _, err := ReplayStrict(payloadFlip, "wal", func(p []byte) error { return nil }); err != nil {
-		t.Fatalf("payload flip in final frame: err=%v, want torn tail", err)
+	if _, err := ReplayStrict(payloadFlip, "wal", func(p []byte) error { return nil }); !errors.Is(err, base.ErrCorruption) {
+		t.Fatalf("payload flip in final frame: err=%v, want ErrCorruption", err)
 	}
 }

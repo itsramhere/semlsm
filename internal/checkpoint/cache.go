@@ -13,8 +13,9 @@ type CkptCache struct {
 }
 
 type cacheEntry struct {
-	r    *Reader
-	refs int
+	r       *Reader
+	refs    int
+	removed bool
 }
 
 // NewCkptCache builds a cache with the given capacity and opener.
@@ -65,6 +66,31 @@ func (c *CkptCache) release(e *cacheEntry) func() {
 		}
 		once = true
 		e.refs--
+		if e.refs == 0 && e.removed {
+			_ = e.r.Close()
+		}
+	}
+}
+
+// Evict removes a dead checkpoint from the cache. Outstanding borrowers keep
+// its reader until their last release, just like the table cache.
+func (c *CkptCache) Evict(num uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := c.m[num]
+	if e == nil {
+		return
+	}
+	delete(c.m, num)
+	for i, n := range c.order {
+		if n == num {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
+	e.removed = true
+	if e.refs == 0 {
+		_ = e.r.Close()
 	}
 }
 

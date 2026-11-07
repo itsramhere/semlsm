@@ -70,6 +70,19 @@ func (db *DB) fastCompactLoop() {
 			return
 		}
 		db.drainObsolete()
+		// One bounded checkpoint job per iteration, alongside (not in place
+		// of) fast SST work. Tier B workers never wait for this copy's I/O.
+		merged, mergeErr := db.compactCheckpoints(context.Background(), true)
+		if mergeErr != nil {
+			if db.closed.Load() {
+				return
+			}
+			db.compactErrs.Add(1)
+			db.logger.Warn("semlsm: checkpoint merge failed", "err", mergeErr)
+			if !db.compactBackoff(&backoff) {
+				return
+			}
+		}
 		// Anti-stall (I11): while L1 is over HardScore, a semantic job
 		// holding the L2 files the fast worker needs is preempted. Checked
 		// every iteration: under constant writes the fast worker may never
@@ -77,6 +90,9 @@ func (db *DB) fastCompactLoop() {
 		db.maybePreemptDeep()
 		plan := db.pickFast()
 		if plan == nil {
+			if merged {
+				continue
+			}
 			select {
 			case <-db.compactWake:
 			case <-db.closeCh:
@@ -334,6 +350,9 @@ func (db *DB) WaitIdle(ctx context.Context) error {
 			if scores[0] >= 1 || scores[1] >= 1 || scores[2] >= 1 || scores[3] >= 1 {
 				idle = false
 			}
+			if db.opts.CkptMergeThreshold >= 0 && len(db.rs.version.Ckpts.ByNum) > db.opts.CkptMergeThreshold {
+				idle = false
+			}
 		}
 		db.mu.Unlock()
 		if idle {
@@ -386,9 +405,8 @@ var (
 
 // drainObsolete moves files whose versions died into the deleter queue.
 // Files die only when their last referencing Version unrefs, so a snapshot
-// keeps them alive (P6.4, M-014 item 4). A dying checkpoint takes its
-// archive SSTs with it (best effort: an already-gone checkpoint leaves its
-// archives for startup cleanup).
+// keeps them alive (P6.4, M-014 item 4). A dying checkpoint carries its
+// archive numbers from the manifest; only legacy metadata needs a file read.
 func (db *DB) drainObsolete() {
 	if db.obsolete == nil {
 		return
@@ -401,7 +419,10 @@ func (db *DB) drainObsolete() {
 			isCkpt = true
 		}
 		if isCkpt {
-			db.enqueueDyingArchives(d.Num)
+			db.enqueueDyingArchives(d.Ckpt)
+			if db.ckptCache != nil {
+				db.ckptCache.Evict(d.Num)
+			}
 		}
 		db.obsolete.Enqueue(version.ObsoleteFile{
 			Path:   filepath.Join(db.dir, fmt.Sprintf("%06d%s", d.Num, suffix)),
@@ -413,20 +434,25 @@ func (db *DB) drainObsolete() {
 
 // enqueueDyingArchives queues the archive SSTs referenced by one dying
 // checkpoint file for deletion.
-func (db *DB) enqueueDyingArchives(ckptNum uint64) {
-	if db.ckptCache == nil {
+func (db *DB) enqueueDyingArchives(cf *manifest.CkptFile) {
+	if cf == nil {
 		return
 	}
-	r, rel, err := db.ckptCache.Get(ckptNum)
+	nums, err := checkpointArchives(db.opts.FS, db.dir, cf)
 	if err != nil {
-		return // the checkpoint is already unreadable; archives leak to P13
+		db.logger.Warn("semlsm: cannot determine dying checkpoint archives", "file", cf.FileNum, "err", err)
+		return
 	}
-	defer rel()
-	for _, t := range r.Tuples() {
-		if t.ArchiveFileNum != 0 {
+	keep, err := checkpointArchiveSet(db.opts.FS, db.dir, db.vs.LiveCheckpoints())
+	if err != nil {
+		db.logger.Warn("semlsm: skipping archive deletion: live archive set unknown", "err", err)
+		return
+	}
+	for _, num := range nums {
+		if !keep[num] {
 			db.obsolete.Enqueue(version.ObsoleteFile{
-				Path: archive.Path(db.archiveDir(), t.ArchiveFileNum),
-				Num:  t.ArchiveFileNum,
+				Path: archive.Path(db.archiveDir(), num),
+				Num:  num,
 			})
 		}
 	}
@@ -953,6 +979,10 @@ func (db *DB) runSemantic(plan *compaction.Plan, sweepNum uint64) error {
 		return db.runStructural(plan) // step 2: raw structural instead
 	}
 
+	// Publish cancellation together with the job, before another worker or
+	// Close can observe the handle.
+	jctx, cancel := context.WithTimeout(context.Background(), db.opts.SemanticJobTimeout)
+	defer cancel()
 	v := db.vs.Acquire()
 	defer v.Unref()
 	db.mu.Lock()
@@ -973,7 +1003,7 @@ func (db *DB) runSemantic(plan *compaction.Plan, sweepNum uint64) error {
 		db.busy[f.Num] = true
 	}
 	db.compactionsInFlight++
-	handle := &semJobHandle{files: make(map[uint64]bool, len(files))}
+	handle := &semJobHandle{cancel: cancel, files: make(map[uint64]bool, len(files))}
 	for _, f := range files {
 		handle.files[f.Num] = true
 	}
@@ -981,8 +1011,8 @@ func (db *DB) runSemantic(plan *compaction.Plan, sweepNum uint64) error {
 	db.mu.Unlock()
 	unmark := func() {
 		db.mu.Lock()
-		for _, f := range files {
-			delete(db.busy, f.Num)
+		for num := range handle.files {
+			delete(db.busy, num)
 		}
 		delete(db.semJobs, handle)
 		db.compactionsInFlight--
@@ -991,12 +1021,16 @@ func (db *DB) runSemantic(plan *compaction.Plan, sweepNum uint64) error {
 		db.wakeFlush()
 	}
 
-	// Per-job context: SemanticJobTimeout plus a preempt cancel (P10.2).
-	jctx, cancel := context.WithTimeout(context.Background(), db.opts.SemanticJobTimeout)
-	defer cancel()
-	handle.cancel = cancel
-
-	res, jstats, err := compaction.RunSemantic(jctx, plan, db.semanticDeps())
+	deps := db.semanticDeps()
+	deps.AllocNum = func() uint64 {
+		num := db.allocFile()
+		db.mu.Lock()
+		db.busy[num] = true
+		handle.files[num] = true
+		db.mu.Unlock()
+		return num
+	}
+	res, jstats, err := compaction.RunSemantic(jctx, plan, deps)
 	if err != nil {
 		unmark()
 		db.foldJobStats(nil, jstats, "failed")

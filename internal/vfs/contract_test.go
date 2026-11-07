@@ -4,9 +4,56 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func trackMemFS(t *testing.T, fs *MemFS) *MemFS {
+	t.Helper()
+	t.Cleanup(func() {
+		if n := fs.OpenFiles(); n != 0 {
+			t.Errorf("leaked %d file handles: %v", n, fs.OpenFileNames())
+		}
+	})
+	return fs
+}
+
+func testMemFS(t *testing.T) *MemFS { return trackMemFS(t, NewMemFS()) }
+
+func TestMemFSHandleNamesAndCrash(t *testing.T) {
+	fs := testMemFS(t)
+	f, _ := fs.Create("z")
+	g, _ := fs.Create("a")
+	r, _ := fs.Open("z")
+	rw, _ := fs.OpenReadWrite("a")
+	if got := fs.OpenFileNames(); !reflect.DeepEqual(got, []string{"a", "a", "z", "z"}) {
+		t.Fatalf("names: %v", got)
+	}
+	fs.Rename("z", "b")
+	fs.Remove("a")
+	if got := fs.OpenFileNames(); !reflect.DeepEqual(got, []string{"a", "a", "b", "b"}) {
+		t.Fatalf("renamed/removed names: %v", got)
+	}
+	clone := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
+	if clone.OpenFiles() != 0 {
+		t.Fatal("crash inherited open handles")
+	}
+	f.Close()
+	f.Close()
+	if fs.OpenFiles() != 3 {
+		t.Fatal("double Close changed handle count")
+	}
+	g.Close()
+	r.Close()
+	rw.Close()
+	if _, err := fs.Open("missing"); err == nil {
+		t.Fatal("missing open succeeded")
+	}
+	if fs.OpenFiles() != 0 {
+		t.Fatal("failed Open changed handle count")
+	}
+}
 
 // contractScenario exercises behavior that must be identical between OSFS and
 // MemFS (M-004 item 8). Differences are bugs in MemFS.
@@ -193,7 +240,7 @@ func TestFSContract(t *testing.T) {
 		contractScenario(t, OSFS{}, t.TempDir())
 	})
 	t.Run("memfs", func(t *testing.T) {
-		fs := NewMemFS()
+		fs := testMemFS(t)
 		fs.MkdirAll("root")
 		contractScenario(t, fs, "root")
 		if n := fs.OpenHandles(); n != 0 {
@@ -206,7 +253,7 @@ func TestFSContract(t *testing.T) {
 // operations on the same name.
 
 func TestMemFSRemoveCreateRemoveKeepsDurableOnCrash(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/X")
 	f.Write([]byte("v1"))
 	f.Sync()
@@ -220,7 +267,7 @@ func TestMemFSRemoveCreateRemoveKeepsDurableOnCrash(t *testing.T) {
 	g.Close()
 	fs.Remove("db/X")
 
-	after := fs.CrashClone(DropUnsynced, nil)
+	after := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	data := readAllVFS(t, after, "db/X")
 	if string(data) != "v1" {
 		t.Fatalf("X after crash = %q, want v1 (durable entry lost)", data)
@@ -232,7 +279,7 @@ func TestMemFSRemoveCreateRemoveKeepsDurableOnCrash(t *testing.T) {
 }
 
 func TestMemFSRenameOverDurableTargetCrash(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	for name, data := range map[string]string{"db/A": "va", "db/T": "vt"} {
 		f, _ := fs.Create(name)
 		f.Write([]byte(data))
@@ -243,7 +290,7 @@ func TestMemFSRenameOverDurableTargetCrash(t *testing.T) {
 
 	// rename over an existing durable target without SyncDir
 	fs.Rename("db/A", "db/T")
-	after := fs.CrashClone(DropUnsynced, nil)
+	after := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	if got := readAllVFS(t, after, "db/T"); string(got) != "vt" {
 		t.Fatalf("T after crash = %q, want vt (revert)", got)
 	}
@@ -252,7 +299,7 @@ func TestMemFSRenameOverDurableTargetCrash(t *testing.T) {
 	}
 	// after SyncDir the rename is durable
 	fs.SyncDir("db")
-	after2 := fs.CrashClone(DropUnsynced, nil)
+	after2 := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	if got := readAllVFS(t, after2, "db/T"); string(got) != "va" {
 		t.Fatalf("T after sync+crash = %q, want va", got)
 	}
@@ -262,7 +309,7 @@ func TestMemFSRenameOverDurableTargetCrash(t *testing.T) {
 }
 
 func TestMemFSTwoRenamesOntoTargetCrash(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	for name, data := range map[string]string{"db/A": "va", "db/B": "vb", "db/T": "vt"} {
 		f, _ := fs.Create(name)
 		f.Write([]byte(data))
@@ -274,7 +321,7 @@ func TestMemFSTwoRenamesOntoTargetCrash(t *testing.T) {
 	fs.Rename("db/A", "db/T") // displaced T (durable) and, below, displaced A (durable)
 	fs.Rename("db/B", "db/T") // displaced A state must not erase the durable T state
 
-	after := fs.CrashClone(DropUnsynced, nil)
+	after := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	if got := readAllVFS(t, after, "db/A"); string(got) != "va" {
 		t.Fatalf("A = %q, want va", got)
 	}
@@ -289,7 +336,7 @@ func TestMemFSTwoRenamesOntoTargetCrash(t *testing.T) {
 // M-004 item 4: closed-handle behavior and the leak counter.
 
 func TestMemFSUseAfterCloseAndOpenHandles(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/x")
 	if n := fs.OpenHandles(); n != 1 {
 		t.Fatalf("handles after create = %d", n)
@@ -323,7 +370,7 @@ func TestMemFSUseAfterCloseAndOpenHandles(t *testing.T) {
 // M-004 item 5: Stat reports the current name, not a stale one.
 
 func TestMemFSStatTracksCurrentName(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/new.tmp")
 	st, err := f.Stat()
 	if err != nil || st.Name != "new.tmp" {
@@ -346,7 +393,7 @@ func TestMemFSStatTracksCurrentName(t *testing.T) {
 
 // Write must honor the handle offset: overwriting in place, then extending.
 func TestMemFSWriteHonorsOffset(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/x")
 	f.Write([]byte("0123456789"))
 	f.Sync()

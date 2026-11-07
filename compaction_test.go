@@ -155,7 +155,7 @@ func checkLSM(t *testing.T, db *DB, model *testmodel.Model) {
 }
 
 func TestBulkLoadTriggersCompaction(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	db, err := Open("db", compactOptions(fs, base.RealClock{}))
 	if err != nil {
 		t.Fatal(err)
@@ -204,7 +204,7 @@ func TestCompactionModelConcurrent(t *testing.T) {
 	model := testmodel.NewModel()
 	gen := testmodel.NewGen(seed, 30, 3000)
 
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	db, err := Open(dir, compactOptions(fs, base.RealClock{}))
 	if err != nil {
@@ -312,7 +312,7 @@ func TestCompactionModelConcurrent(t *testing.T) {
 }
 
 func TestSnapshotPinsFilesUntilRelease(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	// no auto compaction: L0 files stay until CompactLevel(0) consumes them,
 	// making the consumption of the pinned file deterministic
@@ -409,7 +409,7 @@ func TestSnapshotPinsFilesUntilRelease(t *testing.T) {
 func TestCompactFailpointCrash(t *testing.T) {
 	for _, fp := range []string{"compact.before_manifest", "compact.after_manifest"} {
 		t.Run(fp, func(t *testing.T) {
-			fs := vfs.NewMemFS()
+			fs := newTestMemFS(t)
 			dir := "db"
 			db, err := Open(dir, compactOptions(fs, base.RealClock{}))
 			if err != nil {
@@ -439,7 +439,7 @@ func TestCompactFailpointCrash(t *testing.T) {
 			_ = db.CompactLevel(context.Background(), 0) // expected to fail or skip
 
 			// crash at the failpoint moment and reopen
-			after := fs.CrashClone(vfs.DropUnsynced, nil)
+			after := trackTestMemFS(t, fs.CrashClone(vfs.DropUnsynced, nil))
 			_ = db.Close()
 			db2, err := Open(dir, compactOptions(after, base.RealClock{}))
 			if err != nil {
@@ -476,7 +476,7 @@ var errCompactionFailed = errors.New("compaction failed (test)")
 // was rejected by Apply, and the compaction retried forever: WaitIdle never
 // returned.
 func TestL0NonMonotoneRangesCompactionAndReopen(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	opts := compactOptions(fs, base.RealClock{})
 	opts.L0CompactTrigger = 2
@@ -566,7 +566,7 @@ func TestL0NonMonotoneRangesCompactionAndReopen(t *testing.T) {
 // consumed by another compaction is dropped with no error, no backoff and no
 // state change.
 func TestStalePlanDroppedSilently(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	opts := compactOptions(fs, base.RealClock{})
 	opts.L0CompactTrigger = 1 << 20 // no automatic picks
 	opts.L0StallTrigger = 1 << 21
@@ -650,7 +650,7 @@ func equalFileSets(a, b map[int]map[uint64]bool) bool {
 // 5s) instead of retrying every 10ms, counts each failure in Stats, and the
 // DB closes cleanly and settles once the failure is removed.
 func TestCompactionBackoffOnPersistentError(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	opts := compactOptions(fs, base.RealClock{})
 	opts.L0CompactTrigger = 2
 	opts.L0StallTrigger = 64

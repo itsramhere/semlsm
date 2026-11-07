@@ -1,12 +1,96 @@
 package checkpoint
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"testing"
 
 	"semlsm/internal/base"
-	"semlsm/internal/vfs"
+	"semlsm/internal/testutil"
 )
+
+func TestCopyTuplePreservesBytesAndChecksCRCs(t *testing.T) {
+	fs := testutil.NewMemFS(t)
+	w, err := NewWriter(fs, "input.ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := TupleMeta{ID: 7, Group: "g/", TsFrom: 1000, TsTo: 2000, PrevTupleID: 3, ArchiveFileNum: 50}
+	if err := w.AddTuple(meta, []byte(`{ "summary" : "original whitespace" }`), mkEntries(20)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenReader(fs, "input.ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	raw, err := r.tupleBytes(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := NewWriter(fs, "output.ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Put a tuple before the copy so its directory offset really changes.
+	if err := out.AddTuple(TupleMeta{ID: 6}, []byte(`{}`), mkEntries(1)); err != nil {
+		t.Fatal(err)
+	}
+	got, loc, err := out.CopyTuple(r, 7)
+	if err != nil || got != meta || loc.Offset == w.DirEntries()[0].Offset {
+		t.Fatalf("copy: %+v %+v %v", got, loc, err)
+	}
+	if err := out.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := OpenReader(fs, "output.ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyRaw, err := r2.tupleBytes(7)
+	r2.Close()
+	if err != nil || !bytes.Equal(raw, copyRaw) {
+		t.Fatal("copy re-encoded the tuple")
+	}
+	metaLen := int(binary.LittleEndian.Uint32(raw))
+	summaryStart := 4 + metaLen + 4 + 4
+	summaryLen := int(binary.LittleEndian.Uint32(raw[summaryStart-4:]))
+	indexStart := summaryStart + summaryLen + 4
+	for _, offset := range []int{4, summaryStart + 1, indexStart + 1} {
+		// ReadMeta fills the lazy cache first; CopyTuple must still freshly
+		// read and verify the file after it is damaged.
+		if _, err := r.ReadMeta(7); err != nil {
+			t.Fatal(err)
+		}
+		bad := append([]byte(nil), raw...)
+		bad[offset] ^= 1
+		f, err := fs.OpenReadWrite("input.ckpt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// memFile has no Seek: overwrite a prefix containing the raw tuple.
+		prefix := append(append([]byte(nil), magic...), 1, 0, 0, 0)
+		f.Write(append(prefix, bad...))
+		f.Close()
+		writer, err := NewWriter(fs, "bad-copy.ckpt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = writer.CopyTuple(r, 7)
+		writer.Abort()
+		if !errors.Is(err, base.ErrCorruption) {
+			t.Fatalf("damage at %d copied: %v", offset, err)
+		}
+		f, _ = fs.OpenReadWrite("input.ckpt")
+		f.Write(append(prefix, raw...))
+		f.Close()
+	}
+}
 
 func mkEntries(n int) []KeyEntry {
 	entries := make([]KeyEntry, 0, n)
@@ -25,7 +109,7 @@ func mkEntries(n int) []KeyEntry {
 }
 
 func TestCkptRoundTrip(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, err := NewWriter(fs, "db/000001.ckpt")
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +184,7 @@ func TestCkptRoundTrip(t *testing.T) {
 }
 
 func TestCkptFiftyThousandKeys(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, _ := NewWriter(fs, "big.ckpt")
 	entries := mkEntries(50000)
 	meta := TupleMeta{ID: 1, Group: "g/", TsFrom: 1000, TsTo: 600000, SourceCount: 500000}
@@ -132,7 +216,7 @@ func TestCkptFiftyThousandKeys(t *testing.T) {
 }
 
 func TestCkptSingleKeyAndEmptySummary(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, _ := NewWriter(fs, "one.ckpt")
 	meta := TupleMeta{ID: 1, Group: "x"}
 	if err := w.AddTuple(meta, nil, []KeyEntry{{Key: []byte("only"), MinTs: 1, MaxTs: 2, Count: 2, LastKind: base.KindDelete}}); err != nil {
@@ -157,7 +241,7 @@ func TestCkptSingleKeyAndEmptySummary(t *testing.T) {
 }
 
 func TestCkptCorruption(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, _ := NewWriter(fs, "c.ckpt")
 	meta := TupleMeta{ID: 1, Group: "g/"}
 	if err := w.AddTuple(meta, []byte(`{}`), mkEntries(100)); err != nil {
@@ -182,7 +266,7 @@ func TestCkptCorruption(t *testing.T) {
 	for _, off := range samples {
 		corrupt := append([]byte(nil), buf...)
 		corrupt[off] ^= 0x01
-		cfs := vfs.NewMemFS()
+		cfs := testutil.NewMemFS(t)
 		fc, _ := cfs.Create("c.ckpt")
 		fc.Write(corrupt)
 		fc.Close()
@@ -192,6 +276,7 @@ func TestCkptCorruption(t *testing.T) {
 		}
 		// reads must be correct or corrupted, never wrong
 		e, ok, err := r.LookupKey(1, []byte("agent/42/key000050"))
+		r.Close()
 		if err != nil {
 			continue
 		}
@@ -204,7 +289,7 @@ func TestCkptCorruption(t *testing.T) {
 
 func TestCkptPrefixCompression(t *testing.T) {
 	// shared-prefix keys must survive compression and round trip
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, _ := NewWriter(fs, "p.ckpt")
 	entries := []KeyEntry{
 		{Key: []byte("a/1/x"), MinTs: 1, MaxTs: 1, Count: 1, LastKind: base.KindPut},

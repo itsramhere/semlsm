@@ -16,6 +16,7 @@ import (
 	"semlsm/internal/base"
 	"semlsm/internal/failpoint"
 	"semlsm/internal/llm"
+	"semlsm/internal/manifest"
 	"semlsm/internal/testmodel"
 	"semlsm/internal/vfs"
 )
@@ -86,7 +87,7 @@ func hardeningCrashAt(t *testing.T, fp string, mode vfs.CrashMode, rng *rand.Ran
 	t.Helper()
 	t.Cleanup(func() { awaitGoroutineSettle(t) })
 	ctx := context.Background()
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	clk := base.NewManualClock(semStart)
 	stack := newSemStack(t, fs, "db", llm.NewMock(llm.MockValid), 0)
 	o := semOptions(fs, clk, stack)
@@ -112,8 +113,28 @@ func hardeningCrashAt(t *testing.T, fp string, mode vfs.CrashMode, rng *rand.Ran
 
 	// Arm the failpoint and trigger the operation that reaches it.
 	sentinel := errors.New("crash at " + fp)
+	if strings.HasPrefix(fp, "ckptmerge.") {
+		// Build two real semantic checkpoints before arming the merge hook.
+		for i := 40; i < 60; i++ {
+			hardeningCommit(t, db, model, "agent/1/s", i)
+			hardeningCommit(t, db, model, "app/1/e", i)
+		}
+		driveDown(t, db)
+		clk.Advance(3 * time.Hour)
+		if err := db.CompactLevel(ctx, base.NumLevels-1); err != nil {
+			t.Fatal(err)
+		}
+		if checkpointCount(db) < 2 {
+			t.Fatal("merge failpoint needs two checkpoints")
+		}
+		// Keep the events key's newest read exact for this matrix's model
+		// contract; its earlier versions remain summarized in the inputs.
+		hardeningCommit(t, db, model, "app/1/e", 60)
+	}
 	failpoint.SetError(fp, sentinel)
 	switch {
+	case strings.HasPrefix(fp, "ckptmerge."):
+		_ = db.CompactCheckpoints(ctx)
 	case strings.HasPrefix(fp, "flush."):
 		for i := 40; i < 60; i++ {
 			hardeningCommit(t, db, model, "agent/1/s", i)
@@ -138,7 +159,7 @@ func hardeningCrashAt(t *testing.T, fp string, mode vfs.CrashMode, rng *rand.Ran
 	failpoint.Reset()
 
 	// Crash at the failpoint moment and reopen on the clone.
-	after := fs.CrashClone(mode, rng)
+	after := trackTestMemFS(t, fs.CrashClone(mode, rng))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +180,7 @@ func hardeningCrashAt(t *testing.T, fp string, mode vfs.CrashMode, rng *rand.Ran
 	if err := db2.Close(); err != nil {
 		t.Fatal(err)
 	}
-	after2 := after.CrashClone(mode, rng)
+	after2 := trackTestMemFS(t, after.CrashClone(mode, rng))
 	failpoint.SetError("flush.after_sst_sync", sentinel)
 	if _, err := Open("db", hardeningOptions(t, after2, clk)); err == nil {
 		// The recovery flush did not reach the failpoint (nothing to
@@ -170,7 +191,7 @@ func hardeningCrashAt(t *testing.T, fp string, mode vfs.CrashMode, rng *rand.Ran
 		}
 		_ = db3.Flush()
 		db3.Close()
-		after2 = after2.CrashClone(mode, rng)
+		after2 = trackTestMemFS(t, after2.CrashClone(mode, rng))
 	}
 	failpoint.Reset()
 	db3, err := Open("db", hardeningOptions(t, after2, clk))
@@ -235,7 +256,7 @@ func hardeningCheckModel(t *testing.T, db *DB, model *testmodel.Model, allowSumm
 func TestHardeningCorruptionMatrix(t *testing.T) {
 	t.Cleanup(func() { awaitGoroutineSettle(t) })
 	ctx := context.Background()
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	clk := base.NewManualClock(semStart)
 	stack := newSemStack(t, fs, "db", llm.NewMock(llm.MockValid), 0)
 	o := semOptions(fs, clk, stack)
@@ -281,6 +302,10 @@ func TestHardeningCorruptionMatrix(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no files to corrupt")
 	}
+	currentName, err := manifest.ReadCurrent(fs, "db")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, fr := range files {
 		data := hardeningReadFile(t, fs, fr.dir, fr.name)
@@ -290,7 +315,7 @@ func TestHardeningCorruptionMatrix(t *testing.T) {
 				continue
 			}
 			t.Run(fr.name+"@"+fmt.Sprint(off), func(t *testing.T) {
-				bad := fs.CrashClone(vfs.DropUnsynced, nil) // a fresh copy
+				bad := trackTestMemFS(t, fs.CrashClone(vfs.DropUnsynced, nil)) // a fresh copy
 				hardeningFlip(t, bad, fr.dir, fr.name, off)
 				stack2 := newSemStack(t, bad, "db", llm.NewMock(llm.MockValid), 0)
 				o2 := semOptions(bad, clk, stack2)
@@ -305,6 +330,9 @@ func TestHardeningCorruptionMatrix(t *testing.T) {
 					t.Fatalf("unclean open error: %v", err)
 				}
 				defer db2.Close()
+				if fr.name == currentName && off >= len(data)-2 {
+					t.Fatal("complete final manifest frame with a bad CRC must fail Open")
+				}
 				// Every read either returns the exact correct value or an
 				// ErrCorruption — never a wrong answer. app/1/e is ModeEvents
 				// and fully dropped, so a Summarized answer is correct there.
@@ -409,7 +437,7 @@ func TestHardeningIOErrors(t *testing.T) {
 			t.Run(ph.name+"/"+op, func(t *testing.T) {
 				t.Cleanup(func() { awaitGoroutineSettle(t) })
 				errIO := errors.New("injected io error")
-				mem := vfs.NewMemFS()
+				mem := newTestMemFS(t)
 				fs := vfs.NewFaultFS(mem)
 				clk := base.NewManualClock(semStart)
 				stack := newSemStack(t, fs, "db", llm.NewMock(llm.MockValid), 0)

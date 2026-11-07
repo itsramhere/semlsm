@@ -149,6 +149,15 @@ func (r *Reader) loadTuple(id uint64) (*parsedTuple, error) {
 	if err != nil {
 		return nil, err
 	}
+	t, err := parseTuple(id, buf)
+	if err == nil {
+		r.tup[id] = t
+	}
+	return t, err
+}
+
+// parseTuple verifies the CRC and structure of every section.
+func parseTuple(id uint64, buf []byte) (*parsedTuple, error) {
 	t := &parsedTuple{}
 	pos := 0
 	readU32 := func() (uint32, error) {
@@ -205,7 +214,10 @@ func (r *Reader) loadTuple(id uint64) (*parsedTuple, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ckpt: tuple %d index: %w", id, err)
 	}
-	r.tup[id] = t
+	pos += int(idxLen)
+	if pos != len(buf) || t.meta.ID != id {
+		return nil, fmt.Errorf("ckpt: tuple %d identity or length mismatch: %w", id, base.ErrCorruption)
+	}
 	return t, nil
 }
 

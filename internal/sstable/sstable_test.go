@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"semlsm/internal/base"
+	"semlsm/internal/testutil"
 	"semlsm/internal/vfs"
 )
 
@@ -46,7 +47,7 @@ func TestSST100kVsModel(t *testing.T) {
 	const versionsPerKey = 10
 	seed := int64(777)
 	rng := rand.New(rand.NewSource(seed))
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 
 	var entries []sstEntry
 	var model []sstEntry
@@ -164,7 +165,7 @@ func modelLookup(model []sstEntry, user []byte, s uint64) struct {
 }
 
 func TestSSTManyVersionsSameKey(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	var entries []sstEntry
 	for v := 200; v >= 1; v-- {
 		entries = append(entries, sstEntry{
@@ -207,7 +208,7 @@ func TestSSTManyVersionsSameKey(t *testing.T) {
 }
 
 func TestSSTOutOfOrderRejected(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, err := NewWriter(fs, "bad.sst")
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +226,7 @@ func TestSSTOutOfOrderRejected(t *testing.T) {
 }
 
 func TestSSTAbortRemovesFile(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, err := NewWriter(fs, "abort.sst")
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +245,7 @@ func TestSSTAbortRemovesFile(t *testing.T) {
 // must equal the model exactly, or return ErrCorruption — never a wrong
 // answer, never a spurious miss (P3.4 as tightened by M-008 item 3).
 func TestSSTByteFlipMatrix(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	var entries []sstEntry
 	for k := 0; k < 100; k++ {
 		for v := 2; v >= 0; v-- {
@@ -264,7 +265,7 @@ func TestSSTByteFlipMatrix(t *testing.T) {
 		off := rng.Intn(len(orig))
 		corrupt := append([]byte(nil), orig...)
 		corrupt[off] ^= 0x01
-		cfs := vfs.NewMemFS()
+		cfs := testutil.NewMemFS(t)
 		f, _ := cfs.Create("corrupt.sst")
 		f.Write(corrupt)
 		f.Close()
@@ -344,7 +345,7 @@ func readFullSST(f vfs.File, buf []byte) (int, error) {
 }
 
 func TestSSTFooterCorruption(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	entries := []sstEntry{
 		{base.MakeInternalKey([]byte("k"), 5, base.KindPut), []byte("v")},
 	}
@@ -374,7 +375,7 @@ func TestSSTFooterCorruption(t *testing.T) {
 // OpenReaderWithBytes builds a fresh MemFS with the given bytes and opens it.
 func OpenReaderWithBytes(t *testing.T, fs vfs.FS, data []byte, name string) (*Reader, error) {
 	t.Helper()
-	cfs := vfs.NewMemFS()
+	cfs := testutil.NewMemFS(t)
 	f, err := cfs.Create(name)
 	if err != nil {
 		t.Fatal(err)
@@ -389,7 +390,7 @@ func OpenReaderWithBytes(t *testing.T, fs vfs.FS, data []byte, name string) (*Re
 // --- P3.5 cache tests ---
 
 func TestTableCacheEvictionAndRefs(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	const files = 5
 	for i := 0; i < files; i++ {
 		var entries []sstEntry
@@ -429,8 +430,10 @@ func TestTableCacheEvictionAndRefs(t *testing.T) {
 	rel2() // refs drop to 0 after removal -> closed
 
 	// re-get an evicted file: opener must be called again
-	if _, _, err := tc.Get(1); err != nil {
+	if _, release, err := tc.Get(1); err != nil {
 		t.Fatal(err)
+	} else {
+		release()
 	}
 	rel3()
 	// releasing twice is a no-op beyond refs going negative-safe
@@ -443,6 +446,7 @@ func TestTableCacheEvictionAndRefs(t *testing.T) {
 	_ = r0
 	_ = openCount
 	_ = closeCount
+	tc.CloseAll()
 }
 
 func TestTableCacheEvictThenDeleteOnWindows(t *testing.T) {
@@ -503,7 +507,7 @@ func TestBlockCacheLRUAndConcurrency(t *testing.T) {
 
 func TestTableCacheReleaseAfterEvict(t *testing.T) {
 	// M-008 item 1a: Get, Evict, release must close the handle.
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	var entries []sstEntry
 	entries = append(entries, sstEntry{base.MakeInternalKey([]byte("k"), 1, base.KindPut), []byte("v")})
 	buildTable(t, fs, "000001.sst", entries)
@@ -607,7 +611,7 @@ func TestBlockSeekGEPastEnd(t *testing.T) {
 
 func TestWriterFinishEmpty(t *testing.T) {
 	// M-008 item 8: Finish with zero entries returns ErrEmptyTable.
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, err := NewWriter(fs, "empty.sst")
 	if err != nil {
 		t.Fatal(err)
@@ -624,7 +628,7 @@ func TestWriterFinishEmpty(t *testing.T) {
 
 func TestReaderCacheWiring(t *testing.T) {
 	// M-008 item 4: repeat reads hit the cache; cached block not mutated.
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	var entries []sstEntry
 	for k := 0; k < 50; k++ {
 		entries = append(entries, sstEntry{
@@ -689,7 +693,7 @@ func TestReaderCacheWiring(t *testing.T) {
 
 // M-009 item 1: per-Get release idempotence with concurrent holders.
 func TestTableCacheTwoHoldersRelease(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	var entries []sstEntry
 	entries = append(entries, sstEntry{base.MakeInternalKey([]byte("k"), 1, base.KindPut), []byte("v")})
 	buildTable(t, fs, "000001.sst", entries)

@@ -28,11 +28,29 @@ func (db *DB) GetArchived(key []byte, ts uint64) (Result, error) {
 	if err := validateKeyForRead(key); err != nil {
 		return Result{}, err
 	}
-	rs, _ := db.acquireReadState()
+	rs, visible := db.acquireReadState()
 	if rs == nil {
 		return Result{}, ErrClosed
 	}
 	defer releaseReadState(rs)
+	return db.getArchivedAtState(key, ts, visible, rs)
+}
+
+// GetArchived reads an archived version through the snapshot's pinned state.
+func (s *Snapshot) GetArchived(key []byte, ts uint64) (Result, error) {
+	if s.released.Load() {
+		return Result{}, ErrReleased
+	}
+	if err := validateKeyForRead(key); err != nil {
+		return Result{}, err
+	}
+	if ts > s.ts {
+		return Result{}, ErrFutureTimestamp
+	}
+	return s.db.getArchivedAtState(key, ts, s.ts, s.rs)
+}
+
+func (db *DB) getArchivedAtState(key []byte, ts, visible uint64, rs *readState) (Result, error) {
 
 	group := string(base.GroupOf(key, db.opts.GroupDepth, db.opts.GroupDelimiter))
 	var best resolve.Entry
@@ -69,7 +87,10 @@ func (db *DB) GetArchived(key []byte, ts uint64) (Result, error) {
 	// range), so delegate to GetAt. GetArchived is always the exact value
 	// at ts (M-030 item 1).
 	if ts > best.MaxTs {
-		return db.GetAt(key, ts)
+		if ts > visible {
+			return Result{}, ErrFutureTimestamp
+		}
+		return db.getAtState(key, ts, rs)
 	}
 
 	r, err := archive.Open(db.opts.FS, archive.Path(db.archiveDir(), bestNum))

@@ -6,13 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/vfs"
+	"semlsm/internal/testutil"
 )
 
 func testCache(t *testing.T, maxBytes int64) (*Cache, *ManualClock) {
 	t.Helper()
 	clk := NewManualClock(time.Unix(1_000_000, 0))
-	c, err := OpenCache(vfs.NewMemFS(), "db", maxBytes, clk)
+	c, err := OpenCache(testutil.NewMemFS(t), "db", maxBytes, clk)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestCacheKeySeparatesModelPromptAndPromptText(t *testing.T) {
 }
 
 func TestCacheCorruptEntryIsMiss(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	clk := NewManualClock(time.Unix(1_000_000, 0))
 	c, err := OpenCache(fs, "db", 1<<20, clk)
 	if err != nil {
@@ -136,7 +136,7 @@ func TestCacheAtomicWritesLeaveNoTempFiles(t *testing.T) {
 }
 
 func TestCacheOpenRejectsBadCap(t *testing.T) {
-	if _, err := OpenCache(vfs.NewMemFS(), "db", 0, nil); err == nil {
+	if _, err := OpenCache(testutil.NewMemFS(t), "db", 0, nil); err == nil {
 		t.Fatal("cap 0 must be rejected")
 	}
 }

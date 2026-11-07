@@ -47,9 +47,10 @@ type TupleRef struct {
 
 // CkptFile describes one .ckpt file.
 type CkptFile struct {
-	FileNum uint64     `json:"file_num"`
-	Size    int64      `json:"size"`
-	Tuples  []TupleRef `json:"tuples"`
+	FileNum     uint64     `json:"file_num"`
+	Size        int64      `json:"size"`
+	Tuples      []TupleRef `json:"tuples"`
+	ArchiveNums []uint64   `json:"archive_nums"`
 }
 
 // Edit is one manifest record. Snapshot edits carry the full state.
@@ -117,8 +118,8 @@ func (w *Writer) Close() error {
 func (w *Writer) Size() int64 { return w.size }
 
 // ReadAll replays all edits from a manifest under the strict recovery rules
-// (M-011 item 1): only the final frame may be torn; a bad CRC with data
-// after it is corruption, because live files could otherwise be mistaken
+// (M-011 item 1): only an incomplete final frame may be torn; a bad CRC
+// is corruption, because live files could otherwise be mistaken
 // for orphans and deleted. JSON corruption of a complete frame is an error.
 func ReadAll(fs vfs.FS, path string) ([]Edit, error) {
 	var edits []Edit

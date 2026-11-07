@@ -16,7 +16,6 @@ import (
 	"semlsm/internal/llm"
 	"semlsm/internal/resolve"
 	"semlsm/internal/testmodel"
-	"semlsm/internal/vfs"
 )
 
 // TestHistoryInterleaving is the P11.2 test: raw versions and tuple runs
@@ -225,7 +224,7 @@ func TestMVCCModel(t *testing.T) {
 
 func runMVCCSeed(t *testing.T, seed int64) {
 	rng := rand.New(rand.NewSource(seed))
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	clk := base.NewManualClock(semStart)
 	mock := llm.NewMock(llm.MockValid)
 	stack := newSemStack(t, fs, "db", mock, 0)
@@ -607,7 +606,7 @@ func TestIteratorGroupBoundBelowDelimiter(t *testing.T) {
 // recomputes SourceCRC32 from the archives and detects tampering; a deleted
 // archive file gives ErrNotArchived without harming normal reads.
 func TestGetArchivedAndIntegrity(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	clk := base.NewManualClock(semStart)
 	mock := llm.NewMock(llm.MockValid)
 	stack := newSemStack(t, fs, "db", mock, 0)
@@ -664,7 +663,7 @@ func TestGetArchivedAndIntegrity(t *testing.T) {
 
 	// A custom ArchiveDir is honored.
 	db.Close()
-	fs2 := vfs.NewMemFS()
+	fs2 := newTestMemFS(t)
 	clk2 := base.NewManualClock(semStart)
 	stack2 := newSemStack(t, fs2, "db", llm.NewMock(llm.MockValid), 0)
 	o2 := semOptions(fs2, clk2, stack2)

@@ -168,14 +168,15 @@ func (db *DB) finishFlush(item immEntry, sstNum uint64, meta *manifest.FileMeta,
 	db.mu.Unlock()
 	db.manifestMu.Unlock()
 
-	if err := failpoint.Hit(fpFlushAfterManifest); err != nil {
-		return err
-	}
-
-	// close and delete the old WAL (best effort; I6)
+	// Once removed from imms, Close cannot find this WAL. Release its handle
+	// before any post-install error can return.
 	if item.wal != nil {
 		_ = item.wal.Close()
 	}
+	if err := failpoint.Hit(fpFlushAfterManifest); err != nil {
+		return err
+	}
+	// Delete the old WAL (best effort; I6).
 	if item.walNum > 0 {
 		if err := db.opts.FS.Remove(walPath(db.dir, item.walNum)); err == nil {
 			_ = db.opts.FS.SyncDir(db.dir)

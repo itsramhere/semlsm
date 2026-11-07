@@ -115,6 +115,7 @@ func installHandmadeCheckpoint(t *testing.T, db *DB, group string, fromTs, toTs 
 			}
 			if count == 0 {
 				// everything dropped: the file disappears
+				w.Abort()
 				dels = append(dels, manifest.DelFile{Level: l, Num: f.Num})
 				continue
 			}
@@ -208,7 +209,7 @@ func installHandmadeCheckpoint(t *testing.T, db *DB, group string, fromTs, toTs 
 }
 
 func TestCheckpointTruthTableEndToEnd(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	// manual clock so a gap exists between the dropped range and v40
 	clock := base.NewManualClock(time.Unix(1750000000, 0))
@@ -330,7 +331,7 @@ func ts25of(from, to uint64) uint64 {
 func TestCheckpointV49V50to60V61(t *testing.T) {
 	// B6's example: raw v49, dropped v50-60, raw v61; read at 55 must use
 	// the summary, never the stale raw v49.
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	db, err := Open("db", noCompactionOptions(fs, base.RealClock{}))
 	if err != nil {
 		t.Fatal(err)
@@ -397,7 +398,7 @@ func TestCheckpointV49V50to60V61(t *testing.T) {
 
 func TestCheckpointRow7DeleteLast(t *testing.T) {
 	// dropped run ends with a delete: reads at and after the run are NotFound
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	db, err := Open("db", noCompactionOptions(fs, base.RealClock{}))
 	if err != nil {
 		t.Fatal(err)
@@ -446,12 +447,13 @@ func TestCheckpointRow7DeleteLast(t *testing.T) {
 }
 
 func TestVerifyIntegrityCatchesCkptFlip(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	db, err := Open("db", noCompactionOptions(fs, base.RealClock{}))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Close()
 	model := testmodel.NewModel()
 	for i := 0; i < 30; i++ {
 		b := NewBatch()
@@ -504,7 +506,7 @@ func TestVerifyIntegrityCatchesCkptFlip(t *testing.T) {
 	mid := st.Size / 2
 	buf[mid] ^= 0x01
 	// write to a fresh FS with the corrupted file
-	cfs := vfs.NewMemFS()
+	cfs := newTestMemFS(t)
 	cfs.MkdirAll(dir)
 	fc, err := cfs.Create(filepath.Join(dir, ckptName))
 	if err != nil {

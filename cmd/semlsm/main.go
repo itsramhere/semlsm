@@ -53,6 +53,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	if rest[0] == "repair" {
+		report, err := semlsm.Repair(dir, cliDBOptions())
+		for _, f := range report.TruncatedFiles {
+			fmt.Fprintf(stdout, "truncated %s bytes_dropped %d\n", f.Name, f.BytesDropped)
+		}
+		for _, name := range report.QuarantinedFiles {
+			fmt.Fprintf(stdout, "quarantined %s\n", name)
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "semlsm: repair: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "repair truncated %d quarantined %d\n", len(report.TruncatedFiles), len(report.QuarantinedFiles))
+		return 0
+	}
 	opts, err := cliOptions(dir, useLLM)
 	if err != nil {
 		fmt.Fprintf(stderr, "semlsm: %v\n", err)
@@ -123,11 +138,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs := flag.NewFlagSet("compact", flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		level := fs.Int("level", -1, "level to compact")
+		checkpoints := fs.Bool("checkpoints", false, "merge checkpoint files")
 		if err := fs.Parse(args2); err != nil {
 			return 1
 		}
+		if *checkpoints {
+			if err := db.CompactCheckpoints(context.Background()); err != nil {
+				fmt.Fprintf(stderr, "semlsm: compact checkpoints: %v\n", err)
+				return 1
+			}
+			fmt.Fprintln(stdout, "checkpoints compacted")
+			return 0
+		}
 		if *level < 0 {
-			fmt.Fprintln(stderr, "usage: semlsm compact --level N")
+			fmt.Fprintln(stderr, "usage: semlsm compact --level N | --checkpoints")
 			return 1
 		}
 		if err := db.CompactLevel(context.Background(), *level); err != nil {
@@ -283,16 +307,7 @@ func cmdCheckpoints(db *semlsm.DB, args []string, stdout, stderr io.Writer) int 
 // cliOptions builds the CLI's Options: the deterministic mock LLM unless
 // --llm, then the environment-configured HTTP stack.
 func cliOptions(dir string, useLLM bool) (semlsm.Options, error) {
-	opts := semlsm.Options{
-		GroupDepth:     2,
-		GroupDelimiter: '/',
-		Policies: []semlsm.Policy{
-			{Prefix: "agent/", Mode: semlsm.ModeState, MinAge: time.Hour, MinBatch: 100, MaxBatch: 10000},
-			{Prefix: "app/", Mode: semlsm.ModeEvents, MinAge: time.Hour, MinBatch: 100, MaxBatch: 10000},
-		},
-		DefaultPolicy:       semlsm.Policy{Mode: semlsm.ModeDisabled},
-		MinCompressionRatio: 5.0,
-	}
+	opts := cliDBOptions()
 	var client llm.Client
 	if useLLM {
 		httpOpt := llm.HTTPOptionsFromEnv()
@@ -319,6 +334,19 @@ func cliOptions(dir string, useLLM bool) (semlsm.Options, error) {
 	}
 	opts.Summarizer = stack
 	return opts, nil
+}
+
+func cliDBOptions() semlsm.Options {
+	return semlsm.Options{
+		GroupDepth:     2,
+		GroupDelimiter: '/',
+		Policies: []semlsm.Policy{
+			{Prefix: "agent/", Mode: semlsm.ModeState, MinAge: time.Hour, MinBatch: 100, MaxBatch: 10000},
+			{Prefix: "app/", Mode: semlsm.ModeEvents, MinAge: time.Hour, MinBatch: 100, MaxBatch: 10000},
+		},
+		DefaultPolicy:       semlsm.Policy{Mode: semlsm.ModeDisabled},
+		MinCompressionRatio: 5.0,
+	}
 }
 
 // modelName reads the model name from a client that knows it.

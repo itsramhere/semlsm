@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -42,7 +43,8 @@ type MemFS struct {
 	files       map[string]*memState
 	graveyard   []*memState // displaced/removed states whose dir-entry change is not durable yet
 	durableDirs map[string]bool
-	handles     int // open handle count, for leak checks
+	handles     map[*memFile]struct{}
+	locks       map[string]bool
 }
 
 // NewMemFS returns an empty MemFS.
@@ -51,6 +53,8 @@ func NewMemFS() *MemFS {
 		files:       map[string]*memState{},
 		graveyard:   nil,
 		durableDirs: map[string]bool{},
+		handles:     map[*memFile]struct{}{},
+		locks:       map[string]bool{},
 	}
 }
 
@@ -82,8 +86,7 @@ func (fs *MemFS) Create(name string) (File, error) {
 	defer fs.mu.Unlock()
 	st := &memState{name: name}
 	fs.files[name] = st
-	fs.handles++
-	return &memFile{fs: fs, st: st, writable: true}, nil
+	return fs.newHandle(st, true), nil
 }
 
 // Open implements FS. A removed file is not openable, even before SyncDir.
@@ -94,8 +97,7 @@ func (fs *MemFS) Open(name string) (File, error) {
 	if !ok {
 		return nil, errNotExist("open", name)
 	}
-	fs.handles++
-	return &memFile{fs: fs, st: st, writable: false}, nil
+	return fs.newHandle(st, false), nil
 }
 
 // OpenReadWrite implements FS.
@@ -107,8 +109,14 @@ func (fs *MemFS) OpenReadWrite(name string) (File, error) {
 		st = &memState{name: name}
 		fs.files[name] = st
 	}
-	fs.handles++
-	return &memFile{fs: fs, st: st, writable: true}, nil
+	return fs.newHandle(st, true), nil
+}
+
+// newHandle requires fs.mu.
+func (fs *MemFS) newHandle(st *memState, writable bool) *memFile {
+	f := &memFile{fs: fs, st: st, writable: writable}
+	fs.handles[f] = struct{}{}
+	return f
 }
 
 // Rename implements FS.
@@ -203,20 +211,55 @@ func (fs *MemFS) SyncDir(dir string) error {
 	return nil
 }
 
-// Lock implements FS (a no-op in-memory lock).
+// Lock implements FS. CrashClone starts with no process locks.
 func (fs *MemFS) Lock(name string) (LockHandle, error) {
-	return nopLock{}, nil
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.locks[name] {
+		return nil, fmt.Errorf("vfs(memfs): lock %s: already locked", name)
+	}
+	fs.locks[name] = true
+	return &memLock{fs: fs, name: name}, nil
 }
 
-type nopLock struct{}
+type memLock struct {
+	fs       *MemFS
+	name     string
+	unlocked bool
+}
 
-func (nopLock) Unlock() error { return nil }
+func (l *memLock) Unlock() error {
+	l.fs.mu.Lock()
+	defer l.fs.mu.Unlock()
+	if !l.unlocked {
+		delete(l.fs.locks, l.name)
+		l.unlocked = true
+	}
+	return nil
+}
 
 // OpenHandles returns the number of currently open file handles, for leak checks.
 func (fs *MemFS) OpenHandles() int {
+	return fs.OpenFiles()
+}
+
+// OpenFiles returns the number of open file handles, including removed files.
+func (fs *MemFS) OpenFiles() int {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	return fs.handles
+	return len(fs.handles)
+}
+
+// OpenFileNames returns sorted names, one per open handle (including duplicates).
+func (fs *MemFS) OpenFileNames() []string {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	names := make([]string, 0, len(fs.handles))
+	for f := range fs.handles {
+		names = append(names, f.st.name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // CrashClone returns the filesystem as it would look after a process crash
@@ -364,6 +407,6 @@ func (m *memFile) Close() error {
 		return errClosed("close")
 	}
 	m.closed = true
-	m.fs.handles--
+	delete(m.fs.handles, m)
 	return nil
 }

@@ -1,16 +1,39 @@
 package manifest
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
-	"path/filepath"
-
 	"semlsm/internal/base"
+	"semlsm/internal/testutil"
 	"semlsm/internal/vfs"
 	"semlsm/internal/wal"
 )
+
+func TestCheckpointArchiveNumsPresence(t *testing.T) {
+	for _, input := range []string{`{"file_num":1}`, `{"file_num":1,"archive_nums":null}`} {
+		var cf CkptFile
+		if err := json.Unmarshal([]byte(input), &cf); err != nil || cf.ArchiveNums != nil {
+			t.Fatalf("legacy set: %+v %v", cf, err)
+		}
+	}
+	cf := CkptFile{FileNum: 1, ArchiveNums: []uint64{}}
+	payload, err := json.Marshal(cf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"archive_nums":[]`) {
+		t.Fatalf("known-empty set omitted: %s", payload)
+	}
+	var decoded CkptFile
+	if err := json.Unmarshal(payload, &decoded); err != nil || decoded.ArchiveNums == nil {
+		t.Fatalf("empty set lost: %+v %v", decoded, err)
+	}
+}
 
 func sampleEdit(snapshot bool) *Edit {
 	return &Edit{
@@ -55,7 +78,7 @@ func sampleEdit(snapshot bool) *Edit {
 }
 
 func TestManifestRoundTrip(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	e1 := sampleEdit(true)
 	w, err := NewWriter(fs, "MANIFEST-000001")
 	if err != nil {
@@ -115,11 +138,12 @@ func TestManifestRoundTrip(t *testing.T) {
 }
 
 func TestManifestTornTailTolerance(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	w, _ := NewWriter(fs, "MANIFEST-000001")
 	if err := w.Append(sampleEdit(true)); err != nil {
 		t.Fatal(err)
 	}
+	startFinal := w.Size()
 	if err := w.Append(&Edit{NextFileNum: 5}); err != nil {
 		t.Fatal(err)
 	}
@@ -129,8 +153,8 @@ func TestManifestTornTailTolerance(t *testing.T) {
 	full := readAllManifest(t, fs, "MANIFEST-000001")
 
 	// truncate into the last frame: earlier edits survive, no error
-	for cut := len(full) - 20; cut < len(full); cut++ {
-		tfs := vfs.NewMemFS()
+	for cut := int(startFinal); cut < len(full); cut++ {
+		tfs := testutil.NewMemFS(t)
 		f, _ := tfs.Create("MANIFEST-000001")
 		f.Write(full[:cut])
 		f.Close()
@@ -146,9 +170,8 @@ func TestManifestTornTailTolerance(t *testing.T) {
 
 func TestManifestCorruptFrame(t *testing.T) {
 	// A complete frame with a valid CRC but invalid JSON is real corruption.
-	// (A flipped byte inside the final frame is a torn tail by spec and is
-	// ignored, so we craft the bad payload instead.)
-	fs := vfs.NewMemFS()
+	// Bad JSON must remain corruption even when its frame CRC is valid.
+	fs := testutil.NewMemFS(t)
 	w, _ := NewWriter(fs, "MANIFEST-000001")
 	if err := w.Append(sampleEdit(true)); err != nil {
 		t.Fatal(err)
@@ -161,7 +184,7 @@ func TestManifestCorruptFrame(t *testing.T) {
 	if ferr != nil {
 		t.Fatal(ferr)
 	}
-	cfs := vfs.NewMemFS()
+	cfs := testutil.NewMemFS(t)
 	f, _ := cfs.Create("MANIFEST-000001")
 	f.Write(full)
 	f.Write(bad)
@@ -170,9 +193,7 @@ func TestManifestCorruptFrame(t *testing.T) {
 		t.Fatalf("err=%v, want ErrCorruption", err)
 	}
 
-	// a flipped byte inside the FINAL frame's payload is a torn tail and
-	// is ignored (earlier edits survive): each frame is fsynced, so only
-	// the last can be torn
+	// A flipped byte in a complete final frame is damage, not a prefix tear.
 	w2, _ := NewWriter(fs, "MANIFEST-000002")
 	if err := w2.Append(sampleEdit(true)); err != nil {
 		t.Fatal(err)
@@ -185,22 +206,18 @@ func TestManifestCorruptFrame(t *testing.T) {
 	}
 	two := readAllManifest(t, fs, "MANIFEST-000002")
 	torn := append([]byte(nil), two...)
-	torn[len(full)+4] ^= 0x01 // flip inside frame 2's payload
-	tfs := vfs.NewMemFS()
+	torn[len(full)+8] ^= 0x01 // flip inside frame 2's payload
+	tfs := testutil.NewMemFS(t)
 	f3, _ := tfs.Create("MANIFEST-000001")
 	f3.Write(torn)
 	f3.Close()
-	edits, err := ReadAll(tfs, "MANIFEST-000001")
-	if err != nil {
-		t.Fatalf("torn tail must be ignored: %v", err)
-	}
-	if len(edits) != 1 {
-		t.Fatalf("torn tail: edits=%d, want 1", len(edits))
+	if _, err := ReadAll(tfs, "MANIFEST-000001"); !errors.Is(err, base.ErrCorruption) {
+		t.Fatalf("complete final frame: err=%v, want ErrCorruption", err)
 	}
 }
 
 func TestCurrentAtomicity(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	fs.MkdirAll("db")
 
 	if err := SetCurrent(fs, "db", "MANIFEST-000001"); err != nil {
@@ -230,7 +247,7 @@ func TestCurrentAtomicity(t *testing.T) {
 	if err := fs.Rename(tmp, filepath.Join("db", "CURRENT")); err != nil {
 		t.Fatal(err)
 	}
-	after := fs.CrashClone(vfs.DropUnsynced, nil)
+	after := testutil.TrackMemFS(t, fs.CrashClone(vfs.DropUnsynced, nil))
 	cn, err := ReadCurrent(after, "db")
 	if err != nil || cn != "MANIFEST-000001" {
 		t.Fatalf("after crash: got %q err=%v (rename must not be durable before SyncDir)", cn, err)
@@ -239,7 +256,7 @@ func TestCurrentAtomicity(t *testing.T) {
 	if err := fs.SyncDir("db"); err != nil {
 		t.Fatal(err)
 	}
-	after2 := fs.CrashClone(vfs.DropUnsynced, nil)
+	after2 := testutil.TrackMemFS(t, fs.CrashClone(vfs.DropUnsynced, nil))
 	cn2, err := ReadCurrent(after2, "db")
 	if err != nil || cn2 != "MANIFEST-000002" {
 		t.Fatalf("after syncdir+crash: got %q err=%v", cn2, err)
@@ -251,7 +268,7 @@ func TestCurrentAtomicity(t *testing.T) {
 	}
 
 	// empty CURRENT is corruption
-	efs := vfs.NewMemFS()
+	efs := testutil.NewMemFS(t)
 	efs.MkdirAll("db2")
 	f2, _ := efs.Create(filepath.Join("db2", "CURRENT"))
 	f2.Close()
@@ -259,7 +276,7 @@ func TestCurrentAtomicity(t *testing.T) {
 		t.Fatalf("empty current: err=%v", err)
 	}
 	// garbage CURRENT is corruption
-	gfs := vfs.NewMemFS()
+	gfs := testutil.NewMemFS(t)
 	gfs.MkdirAll("db3")
 	g, _ := gfs.Create(filepath.Join("db3", "CURRENT"))
 	g.Write([]byte("garbage"))

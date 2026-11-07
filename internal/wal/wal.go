@@ -21,6 +21,19 @@ const frameHeaderLen = 8
 // ErrFrameTooLarge is returned by Append for oversized payloads.
 var ErrFrameTooLarge = errors.New("wal: frame payload too large")
 
+// ErrFinalFrameCRC identifies a complete final frame with a bad CRC and no
+// valid frame hidden after its header. It also wraps ErrCorruption. Repair
+// may explicitly discard this frame; normal recovery must report it.
+var ErrFinalFrameCRC = fmt.Errorf("wal: final frame crc mismatch: %w", base.ErrCorruption)
+
+func crcError(f vfs.File, path string, offset, frameEnd, fileSize int64) error {
+	err := base.ErrCorruption
+	if frameEnd == fileSize && !hasValidFrameAfter(f, offset+1, fileSize) {
+		err = ErrFinalFrameCRC
+	}
+	return fmt.Errorf("wal: replay %s at offset %d: crc mismatch: %w", path, offset, err)
+}
+
 // Writer appends frames to one WAL file.
 type Writer struct {
 	f    vfs.File
@@ -75,10 +88,12 @@ func (w *Writer) Size() int64 { return w.size }
 // fn must not retain the payload slice.
 //
 // last selects the recovery rule for the file's tail:
-//   - last=true:  a short header, short payload, or CRC mismatch is a torn
+//   - last=true: a short header or short payload is a torn
 //     tail; replay stops there and returns the bytes before it (the caller
 //     truncates the file to validBytes). No error.
 //   - last=false: the same conditions return base.ErrCorruption.
+//
+// A complete frame with a bad CRC is always corruption.
 //
 // validBytes is the offset after the last complete valid frame.
 func Replay(fs vfs.FS, path string, last bool, fn func(payload []byte) error) (validBytes int64, err error) {
@@ -138,6 +153,9 @@ func Replay(fs vfs.FS, path string, last bool, fn func(payload []byte) error) (v
 			return validBytes, fmt.Errorf("wal: replay %s: read payload: %w", path, err)
 		}
 		if got := base.CRC(payload); got != wantCRC {
+			if last {
+				return validBytes, crcError(f, path, validBytes, validBytes+frameHeaderLen+int64(payloadLen), fileSize)
+			}
 			return torn("crc mismatch")
 		}
 		if err := fn(payload); err != nil {
@@ -168,8 +186,7 @@ func Frame(payload []byte) ([]byte, error) {
 // ReplayStrict replays frames with the manifest recovery rules (M-011 item 1).
 // Each manifest edit is fsynced on its own, so only the final frame can
 // legitimately be torn:
-//   - a bad CRC is a torn tail only if that frame ends exactly at EOF;
-//     a bad CRC with bytes after the frame is ErrCorruption;
+//   - a complete frame with a bad CRC is ErrCorruption, including at EOF;
 //   - a declared length past EOF or a short header at the tail is torn;
 //   - a zero-length frame is torn only if all remaining bytes are zero,
 //     otherwise ErrCorruption;
@@ -248,11 +265,7 @@ func ReplayStrict(fs vfs.FS, path string, fn func(payload []byte) error) (validB
 		}
 		if got := base.CRC(payload); got != wantCRC {
 			frameEnd := validBytes + frameHeaderLen + int64(payloadLen)
-			if frameEnd == fileSize {
-				return validBytes, nil // final frame torn
-			}
-			return validBytes, fmt.Errorf("wal: replay strict %s at offset %d: crc mismatch with data after the frame: %w",
-				path, validBytes, base.ErrCorruption)
+			return validBytes, crcError(f, path, validBytes, frameEnd, fileSize)
 		}
 		if err := fn(payload); err != nil {
 			return validBytes, fmt.Errorf("wal: replay strict %s: callback: %w", path, err)

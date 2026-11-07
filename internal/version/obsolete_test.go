@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"semlsm/internal/testutil"
 	"semlsm/internal/vfs"
 )
 
@@ -22,7 +23,7 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 }
 
 func TestObsoleteDeleterDeletes(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	f, _ := fs.Create(filepath.Join("db", "000005.sst"))
 	f.Close()
 	if _, err := fs.Stat(filepath.Join("db", "000005.sst")); err != nil {
@@ -39,7 +40,7 @@ func TestObsoleteDeleterDeletes(t *testing.T) {
 }
 
 func TestObsoleteDeleterRetriesThenFails(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	base := vfs.NewFaultFS(fs)
 	f, _ := base.Create(filepath.Join("db", "000006.sst"))
 	f.Close()
@@ -73,7 +74,7 @@ func TestObsoleteDeleterRetriesThenFails(t *testing.T) {
 }
 
 func TestObsoleteDeleterEvictsTableCache(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	od := NewObsoleteDeleter(fs, nil, 1*time.Millisecond)
 	_ = od
 	// TableCache eviction is covered in sstable tests; here we just ensure

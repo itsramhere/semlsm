@@ -69,7 +69,7 @@ func semOptions(fs vfs.FS, clock base.Clock, stack *llm.Stack) Options {
 // openSemDB opens a DB with the semantic options on a fresh memfs.
 func openSemDB(t *testing.T, dir string, client llm.Client, mutate func(*Options)) (*DB, *base.ManualClock, *llm.MockClient) {
 	t.Helper()
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	clk := base.NewManualClock(semStart)
 	stack := newSemStack(t, fs, dir, client, 0)
 	o := semOptions(fs, clk, stack)
@@ -511,7 +511,7 @@ func TestSemanticFaultModes(t *testing.T) {
 // keep flowing, L0 and L1 keep compacting, the anti-stall rule preempts the
 // job once L1 reaches HardScore, and nothing deadlocks.
 func TestSemanticBlockAndPreempt(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	clk := base.NewManualClock(semStart)
 	stack := newSemStack(t, fs, "db", llm.NewMock(llm.MockBlock), 0)
 	o := semOptions(fs, clk, stack)
@@ -589,7 +589,7 @@ func TestSemanticBlockAndPreempt(t *testing.T) {
 // no calls are made and raw fallback moves the data; reopening with a real
 // budget resumes summarization.
 func TestSemanticBudgetExhaustedFallback(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	clk := base.NewManualClock(semStart)
 	client := llm.NewMock(llm.MockValid)
 	// MaxTokensTotal 1: the first Reserve already fails.
@@ -673,7 +673,7 @@ func TestSemanticCrashAtEveryFailpoint(t *testing.T) {
 	fps := []string{"semantic.after_outputs", "semantic.after_ckpt", "semantic.after_archive", "semantic.after_manifest"}
 	for _, fp := range fps {
 		t.Run(fp, func(t *testing.T) {
-			fs := vfs.NewMemFS()
+			fs := newTestMemFS(t)
 			clk := base.NewManualClock(semStart)
 			mock := llm.NewMock(llm.MockValid)
 			stack := newSemStack(t, fs, "db", mock, 1<<20) // cache on, in the db dir
@@ -714,7 +714,7 @@ func TestSemanticCrashAtEveryFailpoint(t *testing.T) {
 			_ = db.CompactLevel(context.Background(), base.NumLevels-1) // expected to fail
 			failpoint.Reset()
 
-			after := fs.CrashClone(vfs.DropUnsynced, nil)
+			after := trackTestMemFS(t, fs.CrashClone(vfs.DropUnsynced, nil))
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}

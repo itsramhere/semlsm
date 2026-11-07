@@ -51,15 +51,17 @@ var (
 
 // Stats is the engine snapshot returned by DB.Stats.
 type Stats struct {
-	VisibleTs          uint64
-	LastTs             uint64
-	MemtableBytes      int64
-	ImmutableMemtables int
-	StallTime          time.Duration
-	SnapshotsOpen      int
-	LevelFiles         [base.NumLevels]int
-	LevelBytes         [base.NumLevels]int64
-	CompactionErrors   uint64 // failed compaction attempts since Open (M-015 item 6)
+	VisibleTs             uint64
+	LastTs                uint64
+	MemtableBytes         int64
+	ImmutableMemtables    int
+	StallTime             time.Duration
+	SnapshotsOpen         int
+	LevelFiles            [base.NumLevels]int
+	LevelBytes            [base.NumLevels]int64
+	CompactionErrors      uint64 // failed compaction attempts since Open (M-015 item 6)
+	CheckpointMerges      uint64
+	CheckpointFilesMerged uint64 // number of input files rewritten by merges
 
 	// Tier B semantic accounting (P10.3).
 	SemanticTuplesCreated     uint64
@@ -165,6 +167,11 @@ type DB struct {
 	picker              *compaction.Picker
 	compactWG           sync.WaitGroup
 	compactionsInFlight int
+	ckptMergeRunning    bool // guarded by mu; one manual/background merge at a time
+	ckptMergeDone       chan struct{}
+	ckptMergeWG         sync.WaitGroup // registrations under mu, before Close closes admission
+	ckptMerges          atomic.Uint64
+	ckptFilesMerged     atomic.Uint64
 	busy                map[uint64]bool // file numbers used by running compactions
 
 	// Tier B semantic state (P10.2). semJobs is guarded by mu; the counters
@@ -245,7 +252,17 @@ func Open(dir string, opts Options) (*DB, error) {
 	db.semFail = map[string]uint64{}
 	db.semJobsOut = map[string]uint64{}
 	if err := db.openRecover(); err != nil {
-		lockH.Unlock()
+		// Recovery may have opened writers before a later WAL or I/O error.
+		if db.wal != nil {
+			_ = db.wal.Close()
+		}
+		if db.manifest != nil {
+			_ = db.manifest.Close()
+		}
+		if db.rs != nil {
+			db.rs.release()
+		}
+		_ = lockH.Unlock()
 		return nil, err
 	}
 
@@ -297,27 +314,6 @@ func (db *DB) openRecover() error {
 	db.rs = &readState{mem: mem, version: db.vs.Acquire()}
 	db.mu.Unlock()
 
-	// Active WAL: created before replay; recovery replays older WALs and
-	// flushes them into L0 (P5.2 "simple, avoids WAL reuse").
-	// M-013 item 1d: raise the allocator above every existing file number
-	// (SSTs, WALs, ckpts, manifests) BEFORE allocating anything, so the new
-	// WAL can never truncate or shadow an old file.
-	if err := db.scanMaxFileNum(); err != nil {
-		return err
-	}
-	db.manifestMu.Lock()
-	db.walNum = db.allocateFileNum()
-	db.nextFileNumSnapshot()
-	db.manifestMu.Unlock()
-	w, err := wal.NewWriter(db.opts.FS, filepath.Join(db.dir, walName(db.walNum)))
-	if err != nil {
-		return err
-	}
-	db.wal = w
-	if err := db.opts.FS.SyncDir(db.dir); err != nil {
-		return fmt.Errorf("semlsm: syncdir after wal create: %w", err)
-	}
-
 	// Replay WALs with number >= logNum, ascending; only the last tolerates
 	// a torn tail, which is truncated to valid bytes.
 	replayNums, err := db.replayWalNums()
@@ -352,6 +348,28 @@ func (db *DB) openRecover() error {
 				return terr
 			}
 		}
+	}
+
+	// Create the active WAL only after replay succeeds, so a failed Open does
+	// not leave an empty newer WAL that changes which tail may be torn. Recovery
+	// flushes them into L0 (P5.2 "simple, avoids WAL reuse").
+	// M-013 item 1d: raise the allocator above every existing file number
+	// (SSTs, WALs, ckpts, manifests) BEFORE allocating anything, so the new
+	// WAL can never truncate or shadow an old file.
+	if err := db.scanMaxFileNum(); err != nil {
+		return err
+	}
+	db.manifestMu.Lock()
+	db.walNum = db.allocateFileNum()
+	db.nextFileNumSnapshot()
+	db.manifestMu.Unlock()
+	w, err := wal.NewWriter(db.opts.FS, filepath.Join(db.dir, walName(db.walNum)))
+	if err != nil {
+		return err
+	}
+	db.wal = w
+	if err := db.opts.FS.SyncDir(db.dir); err != nil {
+		return fmt.Errorf("semlsm: syncdir after wal create: %w", err)
 	}
 
 	// Flush recovered data to L0 and advance log_num past every replayed WAL.
@@ -415,7 +433,7 @@ func (db *DB) replayWalNums() ([]uint64, error) {
 		if !ok || suffix != ".wal" {
 			continue
 		}
-		if num >= logNum && num != db.walNum {
+		if num >= logNum && (db.walNum == 0 || num != db.walNum) {
 			nums = append(nums, num)
 		}
 	}
@@ -630,6 +648,7 @@ func (db *DB) cleanupOrphans(replayedWals []uint64) error {
 	}
 	for _, e := range entries {
 		if e.IsDir {
+			// Includes lost+found: never sweep or recurse into quarantine.
 			continue
 		}
 		num, ok, suffix := parseFileNum(e.Name)
@@ -656,25 +675,12 @@ func (db *DB) cleanupOrphans(replayedWals []uint64) error {
 		}
 	}
 
-	// Archive orphan sweep (M-027 item 2): archives are referenced only
-	// through TupleMeta.ArchiveFileNum, so one written between its file and
-	// the manifest edit would leak forever. Read every live checkpoint's
-	// tuple metas (one small section per tuple, bounded by Open time) and
-	// delete unreferenced archive files. Reading the checkpoints is the
-	// chosen approach over deferring to P13: correctness at every Open
-	// outweighs the extra metas.
-	keepArchive := map[uint64]bool{}
-	for num := range keepCkpt {
-		r, err := checkpoint.OpenReader(db.opts.FS, filepath.Join(db.dir, ckptName(num)))
-		if err != nil {
-			continue // unreadable ckpt: its archives are left for the deleter
-		}
-		for _, t := range r.Tuples() {
-			if t.ArchiveFileNum != 0 {
-				keepArchive[t.ArchiveFileNum] = true
-			}
-		}
-		r.Close()
+	// If even one legacy live checkpoint is unreadable, the archive union
+	// is unknown. Preserve every archive on this Open.
+	keepArchive, err := liveArchives(db.opts.FS, db.dir, cur)
+	if err != nil {
+		db.logger.Warn("semlsm: skipping archive orphan sweep: live archive set unknown", "err", err)
+		return db.opts.FS.SyncDir(db.dir)
 	}
 	archDir := db.archiveDir()
 	if ents, err := db.opts.FS.List(archDir); err == nil {
@@ -748,6 +754,18 @@ func (db *DB) Close() error {
 		}
 		db.mu.Unlock()
 		db.compactWG.Wait()
+		db.ckptMergeWG.Wait()
+		// A persistent flush error leaves immutable WALs queued. Their data
+		// is already synced by rotate, but their handles still belong to DB.
+		if db.rs != nil {
+			for _, im := range db.rs.imms {
+				if im.wal != nil {
+					if err := im.wal.Close(); err != nil && firstErr == nil {
+						firstErr = err
+					}
+				}
+			}
+		}
 
 		// sync + close WAL
 		if db.wal != nil {
@@ -810,6 +828,8 @@ func (db *DB) Stats() Stats {
 	s.StallTime = time.Duration(db.stallNanos.Load())
 	s.SnapshotsOpen = int(db.snapshotsOpen.Load())
 	s.CompactionErrors = db.compactErrs.Load()
+	s.CheckpointMerges = db.ckptMerges.Load()
+	s.CheckpointFilesMerged = db.ckptFilesMerged.Load()
 
 	// Tier B accounting (P10.3). LLM health comes from the stack's live
 	// state; the capability check keeps non-stack Summarizers working.

@@ -15,6 +15,7 @@ import (
 	"semlsm/internal/base"
 	"semlsm/internal/manifest"
 	"semlsm/internal/testmodel"
+	"semlsm/internal/testutil"
 	"semlsm/internal/vfs"
 )
 
@@ -36,12 +37,23 @@ func testOptions(fs vfs.FS, clock base.Clock) Options {
 func openTestDB(t *testing.T, dir string) *DB {
 	t.Helper()
 	t.Cleanup(func() { awaitGoroutineSettle(t) }) // P13.5
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	db, err := Open(dir, testOptions(fs, base.RealClock{}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return db
+}
+
+// Register before DB/LLM cleanup so their cleanup callbacks run first.
+func trackTestMemFS(t *testing.T, fs *vfs.MemFS) *vfs.MemFS {
+	t.Helper()
+	return testutil.TrackMemFS(t, fs)
+}
+
+func newTestMemFS(t *testing.T) *vfs.MemFS {
+	t.Helper()
+	return trackTestMemFS(t, vfs.NewMemFS())
 }
 
 func TestPutGetDelete(t *testing.T) {
@@ -177,7 +189,7 @@ func TestSnapshotsStableAcrossFlushes(t *testing.T) {
 }
 
 func TestReopenPreservesData(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	db, err := Open(dir, testOptions(fs, base.RealClock{}))
 	if err != nil {
@@ -258,7 +270,7 @@ func TestModelWorkload(t *testing.T) {
 	model := testmodel.NewModel()
 	gen := testmodel.NewGen(seed, 50, 5000)
 
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	db, err := Open(dir, testOptions(fs, base.RealClock{}))
 	if err != nil {
@@ -376,7 +388,7 @@ func TestConcurrentWritersUniqueIncreasingTs(t *testing.T) {
 func TestClockBackwardsStillIncreasing(t *testing.T) {
 	start := time.Unix(1750000000, 0)
 	clock := base.NewManualClock(start)
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	db, err := Open("db", testOptions(fs, clock))
 	if err != nil {
 		t.Fatal(err)
@@ -411,7 +423,7 @@ func TestMemFSCrashMatrix(t *testing.T) {
 		rounds = 2
 	}
 	for round := 0; round < rounds; round++ {
-		fs := vfs.NewMemFS()
+		fs := newTestMemFS(t)
 		dir := "db"
 		db, err := Open(dir, testOptions(fs, base.RealClock{}))
 		if err != nil {
@@ -454,9 +466,9 @@ func TestMemFSCrashMatrix(t *testing.T) {
 		for _, mode := range []vfs.CrashMode{vfs.DropUnsynced, vfs.TornTail} {
 			var after *vfs.MemFS
 			if mode == vfs.DropUnsynced {
-				after = fs.CrashClone(mode, nil)
+				after = trackTestMemFS(t, fs.CrashClone(mode, nil))
 			} else {
-				after = fs.CrashClone(mode, rng)
+				after = trackTestMemFS(t, fs.CrashClone(mode, rng))
 			}
 			// reopen on the crashed FS; SyncAlways means every acknowledged
 			// write must be present
@@ -508,7 +520,7 @@ func modelSample(m *testmodel.Model) []base.Record {
 
 // M-013 item 1: file numbers must never be reused across sessions.
 func TestMultiSessionReopenFlushed(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	value := make([]byte, 2048)
 	for i := range value {
@@ -558,7 +570,7 @@ func TestMultiSessionReopenFlushed(t *testing.T) {
 }
 
 func TestMultiSessionCrashClone(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	value := make([]byte, 2048)
 	current := fs
@@ -585,7 +597,7 @@ func TestMultiSessionCrashClone(t *testing.T) {
 			t.Fatalf("session %d: waitidle: %v", session, err)
 		}
 		// crash instead of Close
-		current = current.CrashClone(vfs.DropUnsynced, nil)
+		current = trackTestMemFS(t, current.CrashClone(vfs.DropUnsynced, nil))
 		_ = db.Close() // the clone has the state; close is irrelevant
 	}
 	db, err := Open(dir, testOptions(current, base.RealClock{}))
@@ -625,7 +637,7 @@ func (f *createTrackingFS) Create(name string) (vfs.File, error) {
 }
 
 func TestNoFileNumberReuse(t *testing.T) {
-	inner := vfs.NewMemFS()
+	inner := newTestMemFS(t)
 	track := &createTrackingFS{FS: inner}
 	dir := "db"
 	db, err := Open(dir, testOptions(track, base.RealClock{}))
@@ -663,7 +675,7 @@ func TestNoFileNumberReuse(t *testing.T) {
 
 // M-013 item 2: a persistent flush error must back off, not hot-loop.
 func TestFlushBackoffOnPersistentError(t *testing.T) {
-	inner := vfs.NewMemFS()
+	inner := newTestMemFS(t)
 	ff := vfs.NewFaultFS(inner)
 	// fail every SST create after the first 2 (initial DB files pass)
 	ff.InjectCreateOn(".sst", errors.New("disk full")) // fail every SST create
@@ -691,7 +703,7 @@ func TestFlushBackoffOnPersistentError(t *testing.T) {
 // produce an error on every read path, never a silent fall-through to an
 // older version in a deeper level (I10/I12).
 func TestSSTRemovedBehindBack(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	opts := compactOptions(fs, base.RealClock{})
 	opts.L0CompactTrigger = 1 << 20 // no automatic compaction
@@ -763,7 +775,7 @@ func TestSSTRemovedBehindBack(t *testing.T) {
 // identical (no durable garbage that bricks the next Open) and the DB must
 // keep working and reopen.
 func TestManifestEditValidatedBeforeAppend(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	db, err := Open(dir, testOptions(fs, base.RealClock{}))
 	if err != nil {

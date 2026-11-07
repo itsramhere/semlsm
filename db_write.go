@@ -306,10 +306,12 @@ func (db *DB) rotate() error {
 		return fmt.Errorf("semlsm: rotate wal: %w", err)
 	}
 	if err := db.opts.FS.SyncDir(db.dir); err != nil {
+		_ = w.Close()
 		return fmt.Errorf("semlsm: rotate wal syncdir: %w", err)
 	}
 	// make the old WAL durable before handing its memtable to the flusher
 	if err := db.wal.Sync(); err != nil {
+		_ = w.Close()
 		return fmt.Errorf("semlsm: rotate wal sync: %w", err)
 	}
 	oldNum := db.walNum

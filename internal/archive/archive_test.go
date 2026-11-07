@@ -5,11 +5,11 @@ import (
 	"testing"
 
 	"semlsm/internal/base"
-	"semlsm/internal/vfs"
+	"semlsm/internal/testutil"
 )
 
 func TestWriteVerifyAndLookup(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	var recs []base.Record
 	for i := 0; i < 5; i++ {
 		recs = append(recs, base.Record{

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"semlsm/internal/testutil"
 	"semlsm/internal/vfs"
 )
 
@@ -26,11 +27,11 @@ func (c *countingClient) Complete(ctx context.Context, r Request) (Response, err
 	return c.resp, nil
 }
 
-func stackConfig(dir string, maxTokens int64) Config {
+func stackConfig(t *testing.T, dir string, maxTokens int64) Config {
 	return Config{
 		Model:             "test-model",
 		PromptVersion:     3,
-		FS:                vfs.NewMemFS(),
+		FS:                testutil.NewMemFS(t),
 		Dir:               dir,
 		MaxTokensTotal:    maxTokens,
 		RequestsPerMinute: 600,
@@ -49,18 +50,18 @@ func TestStackConstructorRejectsBadConfig(t *testing.T) {
 	if _, err := NewSummarizer(next, Config{Dir: "db"}); err == nil {
 		t.Fatal("zero MaxTokensTotal must be rejected")
 	}
-	if _, err := NewSummarizer(nil, stackConfig("db", 1000)); err == nil {
+	if _, err := NewSummarizer(nil, stackConfig(t, "db", 1000)); err == nil {
 		t.Fatal("nil client must be rejected")
 	}
 	if _, err := NewSummarizer(next, func() Config {
-		c := stackConfig("db", 1000)
+		c := stackConfig(t, "db", 1000)
 		c.Dir = ""
 		return c
 	}()); err == nil {
 		t.Fatal("empty Dir must be rejected")
 	}
 	if _, err := NewSummarizer(next, func() Config {
-		c := stackConfig("db", 1000)
+		c := stackConfig(t, "db", 1000)
 		c.RequestsPerMinute = 0
 		return c
 	}()); err == nil {
@@ -70,7 +71,7 @@ func TestStackConstructorRejectsBadConfig(t *testing.T) {
 
 func TestStackHappyPathAndCacheHitSkipsAll(t *testing.T) {
 	next := &countingClient{resp: validResponse(`{"summary":"ok"}`)}
-	s, err := NewSummarizer(next, stackConfig("db", 100_000))
+	s, err := NewSummarizer(next, stackConfig(t, "db", 100_000))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +111,7 @@ func TestStackHappyPathAndCacheHitSkipsAll(t *testing.T) {
 
 func TestStackBudgetExhaustedBeforeBreaker(t *testing.T) {
 	next := &countingClient{resp: validResponse("v")}
-	cfg := stackConfig("db", 10) // tiny: the first estimate already busts it
+	cfg := stackConfig(t, "db", 10) // tiny: the first estimate already busts it
 	s, err := NewSummarizer(next, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +128,7 @@ func TestStackBudgetExhaustedBeforeBreaker(t *testing.T) {
 
 func TestStackBreakerOpen(t *testing.T) {
 	next := &countingClient{failWith: fmt.Errorf("%w: down", ErrTransient)}
-	cfg := stackConfig("db", 1_000_000)
+	cfg := stackConfig(t, "db", 1_000_000)
 	cfg.CacheMaxBytes = 0
 	s, err := NewSummarizer(next, cfg)
 	if err != nil {
@@ -159,7 +160,7 @@ func TestStackBreakerOpen(t *testing.T) {
 
 func TestStackCacheStoresOnlyAcceptedResponses(t *testing.T) {
 	next := &countingClient{resp: validResponse("garbage")}
-	cfg := stackConfig("db", 1_000_000)
+	cfg := stackConfig(t, "db", 1_000_000)
 	cfg.Accept = func(req Request, resp Response) error {
 		if strings.Contains(resp.Text, "garbage") {
 			return errors.New("invalid response")
@@ -194,7 +195,7 @@ func TestStackCacheStoresOnlyAcceptedResponses(t *testing.T) {
 
 func TestStackCacheDisabledWithoutCap(t *testing.T) {
 	next := &countingClient{resp: validResponse("v")}
-	cfg := stackConfig("db", 1_000_000)
+	cfg := stackConfig(t, "db", 1_000_000)
 	cfg.CacheMaxBytes = 0
 	s, err := NewSummarizer(next, cfg)
 	if err != nil {
@@ -214,7 +215,7 @@ func TestStackCacheDisabledWithoutCap(t *testing.T) {
 func TestStackLimiterApplies(t *testing.T) {
 	clk := NewManualClock(time.Unix(1_000_000, 0))
 	next := &countingClient{resp: validResponse("v")}
-	cfg := stackConfig("db", 1_000_000)
+	cfg := stackConfig(t, "db", 1_000_000)
 	cfg.CacheMaxBytes = 0
 	cfg.RequestsPerMinute = 1 // burst of exactly 1 request
 	cfg.TokensPerMinute = 600_000
@@ -252,10 +253,10 @@ func TestStackLimiterApplies(t *testing.T) {
 }
 
 func TestStackSurvivesReopenWithSameFS(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	req := Request{System: "sys", User: "usr", MaxOutputTokens: 30}
 
-	cfg := stackConfig("db", 1_000_000)
+	cfg := stackConfig(t, "db", 1_000_000)
 	cfg.FS = fs
 	next := &countingClient{resp: validResponse("v1")}
 	s1, err := NewSummarizer(next, cfg)
@@ -288,7 +289,7 @@ func TestStackSurvivesReopenWithSameFS(t *testing.T) {
 
 func TestStackContextCancelReleasesEverything(t *testing.T) {
 	clk := NewManualClock(time.Unix(1_000_000, 0))
-	cfg := stackConfig("db", 1_000_000)
+	cfg := stackConfig(t, "db", 1_000_000)
 	cfg.CacheMaxBytes = 0
 	cfg.RequestsPerMinute = 1 // burst of 1
 	cfg.TokensPerMinute = 600_000
@@ -333,7 +334,7 @@ func (f *failingLimiter) TokensPerMinute() int                       { return 1 
 // (ctx cancellation) must be given back, or the breaker wedges forever.
 func TestStackTrialCancelledAtLimiterDoesNotWedge(t *testing.T) {
 	clk := NewManualClock(time.Unix(1_000_000, 0))
-	cfg := stackConfig("db", 1_000_000)
+	cfg := stackConfig(t, "db", 1_000_000)
 	cfg.CacheMaxBytes = 0
 	cfg.Clock = clk
 	next := &countingClient{}
@@ -378,8 +379,8 @@ func TestStackTrialCancelledAtLimiterDoesNotWedge(t *testing.T) {
 // M-025 item 4: a usage-persist failure after a successful call must not
 // discard the paid-for response.
 func TestStackPersistFailureKeepsResponse(t *testing.T) {
-	fs := vfs.NewFaultFS(vfs.NewMemFS())
-	cfg := stackConfig("db", 1_000_000)
+	fs := vfs.NewFaultFS(testutil.NewMemFS(t))
+	cfg := stackConfig(t, "db", 1_000_000)
 	cfg.FS = fs
 	cfg.CacheMaxBytes = 0
 	next := &countingClient{resp: validResponse("v")}

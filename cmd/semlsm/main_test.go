@@ -2,10 +2,143 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"semlsm/internal/base"
+	"semlsm/internal/checkpoint"
+	"semlsm/internal/manifest"
+	"semlsm/internal/vfs"
 )
+
+func TestCLICompactCheckpointsGolden(t *testing.T) {
+	dir := t.TempDir()
+	var out, stderr bytes.Buffer
+	if code := run([]string{"--dir", dir, "put", "raw/key", "value"}, &out, &stderr); code != 0 {
+		t.Fatalf("put: %d %s", code, stderr.String())
+	}
+	fs := vfs.OSFS{}
+	name, err := manifest.ReadCurrent(fs, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edits, err := manifest.ReadAll(fs, filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit := manifest.Edit{NextFileNum: 3000}
+	for i := uint64(0); i < 2; i++ {
+		num := 1000 + i
+		path := filepath.Join(dir, fmt.Sprintf("%06d.ckpt", num))
+		w, err := checkpoint.NewWriter(fs, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta := checkpoint.TupleMeta{ID: 2000 + i, Group: "g/", TsFrom: i + 1, TsTo: i + 1}
+		if i != 0 {
+			meta.PrevTupleID = 2000
+		}
+		if err := w.AddTuple(meta, []byte(`{}`), []checkpoint.KeyEntry{{Key: []byte("g/key"), MinTs: i + 1, MaxTs: i + 1, Count: 1, LastKind: base.KindPut}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Finish(); err != nil {
+			t.Fatal(err)
+		}
+		loc := w.DirEntries()[0]
+		edit.AddCkpts = append(edit.AddCkpts, manifest.CkptFile{FileNum: num, ArchiveNums: []uint64{}, Tuples: []manifest.TupleRef{{ID: meta.ID, Group: meta.Group, TsFrom: meta.TsFrom, TsTo: meta.TsTo, Offset: loc.Offset, Length: loc.Length}}})
+	}
+	w, err := manifest.NewWriter(fs, filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edit := range append(edits, edit) {
+		if err := w.Append(&edit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+	out.Reset()
+	stderr.Reset()
+	if code := run([]string{"--dir", dir, "compact", "--checkpoints"}, &out, &stderr); code != 0 || out.String() != "checkpoints compacted\n" || stderr.Len() != 0 {
+		t.Fatalf("compact golden: %d %q %q", code, out.String(), stderr.String())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".ckpt") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("CLI did not merge: %d checkpoint files", count)
+	}
+}
+
+func TestCLIRepairGolden(t *testing.T) {
+	dir := t.TempDir()
+	var out, stderr bytes.Buffer
+	if code := run([]string{"--dir", dir, "put", "agent/1/k", "value"}, &out, &stderr); code != 0 {
+		t.Fatalf("put: %d %s", code, stderr.String())
+	}
+	name, err := manifest.ReadCurrent(vfs.OSFS{}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Add one complete edit, then damage its payload.
+	// Use the manifest writer on another file to produce its canonical frame.
+	temp := filepath.Join(dir, "edit.tmp")
+	w, err := manifest.NewWriter(vfs.OSFS{}, temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Append(&manifest.Edit{NextFileNum: 900}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := os.ReadFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame[len(frame)-1] ^= 1
+	if err := os.WriteFile(path, append(data, frame...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "999999.sst"), []byte("preserve me"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	stderr.Reset()
+	if code := run([]string{"repair", "--dir", dir}, &out, &stderr); code != 0 {
+		t.Fatalf("repair: %d %s", code, stderr.String())
+	}
+	want := fmt.Sprintf("truncated %s bytes_dropped %d\nquarantined %s\nrepair truncated 1 quarantined 1\n", name, len(frame), filepath.Join("lost+found", "999999.sst"))
+	if out.String() != want || stderr.Len() != 0 {
+		t.Fatalf("repair golden:\ngot %q stderr %q\nwant %q", out.String(), stderr.String(), want)
+	}
+	out.Reset()
+	stderr.Reset()
+	if code := run([]string{"--dir", dir, "get", "agent/1/k"}, &out, &stderr); code != 0 || !strings.Contains(out.String(), "value @") {
+		t.Fatalf("after repair: %d %s %s", code, out.String(), stderr.String())
+	}
+	out.Reset()
+	stderr.Reset()
+	if code := run([]string{"--dir", t.TempDir(), "repair"}, &out, &stderr); code != 1 || !strings.Contains(stderr.String(), "semlsm: repair:") {
+		t.Fatalf("repair error: %d %q", code, stderr.String())
+	}
+}
 
 // TestCLIGolden runs the CLI through run() against a temp dir and checks the
 // golden outputs (P14.1). Exit codes: 0 ok, 1 on error.

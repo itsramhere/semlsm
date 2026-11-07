@@ -60,12 +60,52 @@ key, merging the raw stream with tuple key entries;
    one `.ckpt` with all tuples, optional per-tuple archive SSTs (each
    verified by reading back and recomputing `SourceCRC32`).
 6. The driver appends ONE manifest edit under `manifestMu` (del inputs,
-   add outputs, add ckpt), installs the new read state under `mu` nested
-   inside `manifestMu`, and obsolete deletion happens through version death.
+   add outputs, add ckpt with its archive numbers), installs the new read state
+   under `mu` nested inside `manifestMu`, and obsolete deletion happens through
+   version death.
 
 `PrevTupleID` is the group's most recently created tuple (largest id; the
 allocator is monotonic across restarts). Jobs can drop progressively older
 ranges, so insertion order — not ts order — defines the chain.
+
+### Checkpoint merging
+
+`Options.CkptMergeThreshold` defaults to 32; a negative value disables
+background merges. When current has more files than the threshold, the fast
+compaction loop performs at most one merge per iteration alongside its SST
+work. Semantic workers continue independently. `DB.CompactCheckpoints(ctx)`
+(and CLI `compact --checkpoints`) performs one merge immediately, including
+when automatic merging is disabled. Its input cap is max(2, threshold).
+
+Inputs are the oldest available file numbers, skipping busy files. One merge
+runs at a time; its inputs and output are reserved in the existing busy map.
+Semantic output numbers stay busy through installation and job completion.
+Semantic jobs consult checkpoint metadata for predecessor IDs; they do not
+read checkpoint files, and unchanged tuple IDs make this safe across merges.
+
+A pinned input version protects files throughout copying. Outside engine
+locks, `checkpoint.Writer.CopyTuple` freshly reads and verifies all section
+CRCs and the key index, then writes the original tuple bytes. Only directory
+offsets change. The output manifest record carries every tuple reference and
+the union of archive numbers. Under manifestMu, the merge rechecks current
+membership and its busy reservations, then appends one AddCkpts + DelCkpts
+edit and installs under mu. Old files die only after all versions release
+them; checkpoint cache eviction releases dead readers before deletion.
+
+`ckptmerge.after_write` runs after output sync and directory sync but before
+any edit; precommit errors remove the output, while a crash leaves an orphan
+for Open to sweep. `ckptmerge.after_manifest` runs after durable installation:
+errors there retain the referenced output. If manifest append/sync fails
+before Apply, a fresh snapshot of the unchanged state is published before
+removing the candidate: failed syncs can leave complete frames readable.
+If restoring that snapshot also fails, the output is retained because its
+durability is uncertain. The new checkpoint protects its
+archives during input version death. Snapshot Get, iteration, and
+GetArchived continue using the original pinned version. Close stops new
+merge admission and waits for in-flight manual and background merges.
+
+Merges retain every tuple and summary. They bound file count; they do not
+implement tuple retention or shrink historical summary contents.
 
 ## 5. Reliability layers (P9)
 
@@ -97,20 +137,48 @@ held across I/O or LLM calls.
 
 ## 7. Recovery
 
-Open: LOCK → OPTIONS.json check → manifest replay (torn final frame ignored
-per plan; anything else `ErrCorruption`) → delete files not in the manifest
-(SSTs/ckpts/WALs/tmps) plus archive segments no live tuple references →
-replay WALs ≥ log_num (only the last WAL tolerates a torn tail) → flush
-replayed data to L0 → start workers.
+Open takes LOCK, checks OPTIONS.json, replays the manifest and WALs numbered
+at least log_num (only the newest WAL tolerates a torn tail), creates a fresh
+WAL, flushes replayed data to L0, sweeps unreferenced SSTs/ckpts/replayed
+WALs/tmps and archives, then starts workers. A failed Open closes its writers
+and releases LOCK; it does not create an empty newer WAL before discovering
+a bad older one.
+
+A short header, declared length past EOF, or permitted zero tail is torn.
+Complete frames with bad CRCs are `ErrCorruption`, even in the final manifest
+frame or last WAL. Manifest recovery still searches past an invalid length
+for valid later frames, which makes it corruption rather than a tail tear.
+
+`Repair(dir, opts)` / `semlsm --dir DIR repair` acquires the same LOCK. It
+validates CURRENT's manifest and all WALs Open would replay; only a complete
+final bad-CRC frame in that manifest or the newest eligible WAL can be
+explicitly discarded. Middle corruption, valid frames hidden after damage,
+and invalid JSON/batches with valid CRCs remain errors. Repair recovers the
+preceding version, moves every unreferenced data file into `lost+found/`
+(archives under `lost+found/archive/`), syncs the directories, then truncates
+and syncs the damaged logs. It never deletes data files or overwrites an
+existing quarantine entry. A following Open ignores `lost+found/` entirely.
+
+Each checkpoint's manifest record carries `archive_nums`. Version membership
+counts keep checkpoints alive across snapshots; the obsolete record retains
+the dying version's checkpoint metadata. Archive deletion uses those numbers
+and excludes archives referenced by ANY live version, including snapshot-only
+checkpoints. The locked VersionSet.LiveCheckpoints accessor supplies independent
+metadata copies for that union. Legacy records
+without numbers fall back to checked tuple reads. If a live legacy archive
+set cannot be determined, Open logs and skips archive deletion entirely;
+Repair returns an error rather than guessing which archives to quarantine.
+
+MemFS tracks every Create/Open/OpenReadWrite handle, exposes sorted names
+for diagnostics, and counts a handle's Close only once. Crash clones start
+with no handles or process locks. Root and internal MemFS test fixtures check
+for zero handles after DB, cache, and stack use has ended.
 
 ## 8. Known limitations
 
-- **Silent torn-tail rollback**: a byte flip in the manifest's final frame
-  is treated as a torn write (per the plan's WAL-like rule), rolling back
-  the last committed edit to the previous state. No wrong answer is served
-  and the next Open sweeps the orphan files, but the rollback is silent. A
-  stricter variant would treat a full-length frame with a bad CRC as
-  `ErrCorruption` and tolerate only short frames.
-- Checkpoint files accumulate one per semantic job (no tuple GC yet).
+- Real disks may tear a write in a non-prefix pattern (for example sector
+  reordering). A complete final frame with a bad CRC is now `ErrCorruption`;
+  recovery requires explicit Repair. The MemFS crash model only keeps prefixes.
+- Tuple retention (dropping old summaries) is not implemented; merges keep all tuples.
 - `Picker` round-robin cursors are guarded by a mutex shared with manual
   `CompactLevel` callers.

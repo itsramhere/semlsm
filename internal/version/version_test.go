@@ -201,6 +201,45 @@ func TestVersionRefCountAndObsolete(t *testing.T) {
 	}
 }
 
+func TestObsoleteCheckpointRetainsArchivesAcrossVersions(t *testing.T) {
+	vs := NewVersionSet()
+	cf := manifest.CkptFile{FileNum: 10, ArchiveNums: []uint64{20, 21}}
+	if _, err := vs.Apply(&manifest.Edit{AddCkpts: []manifest.CkptFile{cf}}); err != nil {
+		t.Fatal(err)
+	}
+	a := vs.Acquire()
+	if _, err := vs.Apply(&manifest.Edit{}); err != nil {
+		t.Fatal(err)
+	}
+	b := vs.Acquire()
+	if _, err := vs.Apply(&manifest.Edit{DelCkpts: []uint64{10}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := vs.TakeObsolete(); len(got) != 0 {
+		t.Fatalf("pinned checkpoint obsolete: %+v", got)
+	}
+	live := vs.LiveCheckpoints()
+	if len(live) != 1 || live[0].FileNum != 10 {
+		t.Fatalf("snapshot-only checkpoint omitted: %+v", live)
+	}
+	live[0].ArchiveNums[0] = 999
+	if got := vs.LiveCheckpoints(); got[0].ArchiveNums[0] != 20 {
+		t.Fatal("accessor exposed mutable archive metadata")
+	}
+	b.Unref()
+	if got := vs.TakeObsolete(); len(got) != 0 {
+		t.Fatalf("older pin lost: %+v", got)
+	}
+	a.Unref()
+	got := vs.TakeObsolete()
+	if len(got) != 1 || got[0].Level != -1 || got[0].Num != 10 || got[0].Ckpt == nil || len(got[0].Ckpt.ArchiveNums) != 2 || got[0].Ckpt.ArchiveNums[1] != 21 {
+		t.Fatalf("obsolete metadata: %+v", got)
+	}
+	if got := vs.TakeObsolete(); len(got) != 0 {
+		t.Fatalf("checkpoint queued twice: %+v", got)
+	}
+}
+
 func TestVersionUnchangedFilesShared(t *testing.T) {
 	vs := NewVersionSet()
 	v1, _ := vs.Apply(&manifest.Edit{NextFileNum: 2, AddFiles: []manifest.FileMeta{fm(0, 1, "a", "c")}})

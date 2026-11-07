@@ -9,7 +9,6 @@ import (
 
 	"semlsm/internal/base"
 	"semlsm/internal/llm"
-	"semlsm/internal/vfs"
 )
 
 func TestOptionsDefaults(t *testing.T) {
@@ -34,6 +33,13 @@ func TestOptionsDefaults(t *testing.T) {
 	}
 	if o.SemanticWorkers != 1 || o.MaxChunkBytes != 32<<10 {
 		t.Fatal("semantic defaults wrong")
+	}
+	if o.CkptMergeThreshold != 32 {
+		t.Fatal("checkpoint merge default wrong")
+	}
+	disabled, err := (Options{CkptMergeThreshold: -1}).withDefaults()
+	if err != nil || disabled.CkptMergeThreshold != -1 {
+		t.Fatal("negative threshold must disable automatic merging")
 	}
 	if o.HardScore != 2.0 || o.MinCompressionRatio != 5.0 {
 		t.Fatal("score defaults wrong")
@@ -105,7 +111,7 @@ func TestOptionsTokenRateCoversWorstCaseRequest(t *testing.T) {
 
 	// Default MaxChunkBytes (32 KiB): worst case = 32768/3 + 2048 = 12970.
 	tooSmall := newStack(100)
-	o := Options{FS: vfs.NewMemFS(), Summarizer: tooSmall}
+	o := Options{FS: newTestMemFS(t), Summarizer: tooSmall}
 	_, err := o.withDefaults()
 	if err == nil || !strings.Contains(err.Error(), "TokensPerMinute") {
 		t.Fatalf("want TokensPerMinute rejection, got %v", err)
@@ -113,13 +119,13 @@ func TestOptionsTokenRateCoversWorstCaseRequest(t *testing.T) {
 
 	// A rate that covers the worst case passes validation.
 	bigEnough := newStack(20_000)
-	o = Options{FS: vfs.NewMemFS(), Summarizer: bigEnough}
+	o = Options{FS: newTestMemFS(t), Summarizer: bigEnough}
 	if _, err := o.withDefaults(); err != nil {
 		t.Fatalf("sufficient rate rejected: %v", err)
 	}
 
 	// A non-Stack Summarizer without the capability is not checked.
-	o = Options{FS: vfs.NewMemFS(), Summarizer: plainSummarizer{}}
+	o = Options{FS: newTestMemFS(t), Summarizer: plainSummarizer{}}
 	if _, err := o.withDefaults(); err != nil {
 		t.Fatalf("capability-less summarizer must not be checked: %v", err)
 	}
@@ -164,7 +170,7 @@ func TestPolicyFor(t *testing.T) {
 }
 
 func TestOptionsFileRoundTrip(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := newTestMemFS(t)
 	dir := "db"
 	fs.MkdirAll(dir)
 	o, _ := (Options{

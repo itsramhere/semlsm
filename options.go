@@ -73,6 +73,7 @@ type Options struct {
 	HardScore             float64        // 2.0
 	SemanticSweepInterval time.Duration  // 10 min
 	MinCompressionRatio   float64        // 5.0
+	CkptMergeThreshold    int            // 32; negative disables automatic merging
 
 	ArchiveRaw      bool
 	ArchiveDir      string
@@ -166,6 +167,9 @@ func (o Options) withDefaults() (Options, error) {
 	}
 	if o.MaxOpenTables <= 0 {
 		o.MaxOpenTables = 256
+	}
+	if o.CkptMergeThreshold == 0 {
+		o.CkptMergeThreshold = 32
 	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)

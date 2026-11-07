@@ -135,6 +135,36 @@ func (w *Writer) AddTuple(meta TupleMeta, summaryJSON []byte, entries []KeyEntry
 	return nil
 }
 
+// CopyTuple freshly reads and verifies every section of id, then appends the
+// original bytes without re-encoding metadata, summary, or key index. Only the
+// returned directory offset changes. It does not populate the reader cache.
+func (w *Writer) CopyTuple(r *Reader, id uint64) (TupleMeta, DirEntry, error) {
+	if w.finished {
+		return TupleMeta{}, DirEntry{}, fmt.Errorf("ckpt: copy after finish %s", w.path)
+	}
+	raw, err := r.tupleBytes(id)
+	if err != nil {
+		return TupleMeta{}, DirEntry{}, err
+	}
+	t, err := parseTuple(id, raw)
+	if err != nil {
+		return TupleMeta{}, DirEntry{}, err
+	}
+	if _, err := iterIndex(t.index); err != nil {
+		return TupleMeta{}, DirEntry{}, err
+	}
+	d := DirEntry{ID: id, Offset: uint64(w.offset), Length: uint64(len(raw))}
+	if n, err := w.f.Write(raw); err != nil {
+		return TupleMeta{}, DirEntry{}, fmt.Errorf("ckpt: copy tuple %d: %w", id, err)
+	} else if n != len(raw) {
+		return TupleMeta{}, DirEntry{}, io.ErrShortWrite
+	}
+	w.offset += int64(len(raw))
+	w.dir = append(w.dir, d)
+	w.tuples++
+	return t.meta, d, nil
+}
+
 // Finish writes the directory and footer, syncs, and closes.
 func (w *Writer) Finish() error {
 	if w.finished {

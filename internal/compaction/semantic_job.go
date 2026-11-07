@@ -363,7 +363,7 @@ func RunSemantic(ctx context.Context, plan *Plan, d SemanticDeps) (*SemanticResu
 		if st, err := d.FS.Stat(filepath.Join(d.Dir, fmt.Sprintf("%06d.ckpt", ckptNum))); err == nil {
 			size = st.Size
 		}
-		res.Ckpt = manifest.CkptFile{FileNum: ckptNum, Size: size}
+		res.Ckpt = manifest.CkptFile{FileNum: ckptNum, Size: size, ArchiveNums: append([]uint64{}, res.Archives...)}
 		for i := range drafts {
 			res.Ckpt.Tuples = append(res.Ckpt.Tuples, manifest.TupleRef{
 				ID:     drafts[i].meta.ID,

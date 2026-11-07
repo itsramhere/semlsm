@@ -17,7 +17,7 @@ func writeAll(t *testing.T, f File, data string) {
 }
 
 func TestMemFSUnsyncedDataLost(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, err := fs.Create("db/000001.sst")
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +30,7 @@ func TestMemFSUnsyncedDataLost(t *testing.T) {
 	f.Close()
 	fs.SyncDir("db")
 
-	after := fs.CrashClone(DropUnsynced, nil)
+	after := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	rf, err := after.Open("db/000001.sst")
 	if err != nil {
 		t.Fatalf("file should exist after crash: %v", err)
@@ -50,7 +50,7 @@ func TestMemFSUnsyncedDataLost(t *testing.T) {
 }
 
 func TestMemFSTornTail(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/000001.sst")
 	writeAll(t, f, "0123456789")
 	f.Sync()
@@ -60,7 +60,7 @@ func TestMemFSTornTail(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(7))
 	for i := 0; i < 50; i++ {
-		after := fs.CrashClone(TornTail, rng)
+		after := trackMemFS(t, fs.CrashClone(TornTail, rng))
 		rf, err := after.Open("db/000001.sst")
 		if err != nil {
 			t.Fatal(err)
@@ -82,7 +82,7 @@ func TestMemFSTornTail(t *testing.T) {
 }
 
 func TestMemFSRenameRevertsOnCrash(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/CURRENT.tmp")
 	writeAll(t, f, "MANIFEST-000001")
 	f.Sync()
@@ -93,7 +93,7 @@ func TestMemFSRenameRevertsOnCrash(t *testing.T) {
 	if err := fs.Rename("db/CURRENT.tmp", "db/CURRENT"); err != nil {
 		t.Fatal(err)
 	}
-	after := fs.CrashClone(DropUnsynced, nil)
+	after := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	if _, err := after.Open("db/CURRENT"); err == nil {
 		t.Fatal("CURRENT should not exist after crash before SyncDir")
 	}
@@ -105,7 +105,7 @@ func TestMemFSRenameRevertsOnCrash(t *testing.T) {
 
 	// now with SyncDir: rename is durable
 	fs.SyncDir("db")
-	after2 := fs.CrashClone(DropUnsynced, nil)
+	after2 := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	rf2, err := after2.Open("db/CURRENT")
 	if err != nil {
 		t.Fatalf("CURRENT should exist after SyncDir: %v", err)
@@ -117,7 +117,7 @@ func TestMemFSRenameRevertsOnCrash(t *testing.T) {
 }
 
 func TestMemFSRemoveNotDurableSurvives(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/000001.sst")
 	writeAll(t, f, "data")
 	f.Sync()
@@ -125,32 +125,34 @@ func TestMemFSRemoveNotDurableSurvives(t *testing.T) {
 	fs.SyncDir("db")
 
 	fs.Remove("db/000001.sst")
-	after := fs.CrashClone(DropUnsynced, nil)
-	if _, err := after.Open("db/000001.sst"); err != nil {
+	after := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
+	if f, err := after.Open("db/000001.sst"); err != nil {
 		t.Fatal("removal without SyncDir must not be durable")
+	} else {
+		f.Close()
 	}
 	fs.SyncDir("db")
-	after2 := fs.CrashClone(DropUnsynced, nil)
+	after2 := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	if _, err := after2.Open("db/000001.sst"); err == nil {
 		t.Fatal("removal should be durable after SyncDir")
 	}
 }
 
 func TestMemFSCreatedNotInDurableDirLost(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/000001.sst")
 	writeAll(t, f, "data")
 	f.Sync()
 	f.Close()
 	// no SyncDir("db") at all
-	after := fs.CrashClone(DropUnsynced, nil)
+	after := trackMemFS(t, fs.CrashClone(DropUnsynced, nil))
 	if _, err := after.Open("db/000001.sst"); err == nil {
 		t.Fatal("file in never-synced dir must be absent after crash")
 	}
 }
 
 func TestMemFSReadSemantics(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("x")
 	writeAll(t, f, "hello world")
 	f.Close()
@@ -174,7 +176,7 @@ func TestMemFSReadSemantics(t *testing.T) {
 }
 
 func TestMemFSListAndStat(t *testing.T) {
-	fs := NewMemFS()
+	fs := testMemFS(t)
 	f, _ := fs.Create("db/a.sst")
 	writeAll(t, f, "12345")
 	f.Close()
@@ -213,7 +215,7 @@ func TestMemFSListAndStat(t *testing.T) {
 }
 
 func TestFaultFSInjectedErrorsSurface(t *testing.T) {
-	base := NewMemFS()
+	base := testMemFS(t)
 	ff := NewFaultFS(base)
 	sentinel := errors.New("injected sync failure")
 	ff.Inject("Sync", 1, sentinel)
@@ -222,6 +224,7 @@ func TestFaultFSInjectedErrorsSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
 	writeAll(t, f, "payload")
 	if err := f.Sync(); err != sentinel {
 		t.Fatalf("first sync: %v", err)

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"semlsm/internal/testutil"
 	"semlsm/internal/vfs"
 )
 
@@ -19,7 +20,7 @@ func openBudget(t *testing.T, fs vfs.FS, dir string, max int64) *Budget {
 }
 
 func TestBudgetZeroMaxRejected(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	if _, err := OpenBudget(fs, "db", 0); err == nil {
 		t.Fatal("MaxTokensTotal=0 must be rejected")
 	}
@@ -29,7 +30,7 @@ func TestBudgetZeroMaxRejected(t *testing.T) {
 }
 
 func TestBudgetReserveRecordPersist(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	b := openBudget(t, fs, "db", 10_000)
 
 	if err := b.Reserve(1000); err != nil {
@@ -63,7 +64,7 @@ func TestBudgetReserveRecordPersist(t *testing.T) {
 }
 
 func TestBudgetExhausted(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	b := openBudget(t, fs, "db", 1000)
 	if err := b.Reserve(900); err != nil {
 		t.Fatal(err)
@@ -86,7 +87,7 @@ func TestBudgetExhausted(t *testing.T) {
 }
 
 func TestBudgetSurvivesReopen(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	b := openBudget(t, fs, "db", 5000)
 	if err := b.Reserve(600); err != nil {
 		t.Fatal(err)
@@ -111,7 +112,7 @@ func TestBudgetSurvivesReopen(t *testing.T) {
 }
 
 func TestBudgetCorruptFileIsAnError(t *testing.T) {
-	fs := vfs.NewMemFS()
+	fs := testutil.NewMemFS(t)
 	dir := filepath.Join("db", "llm")
 	if err := fs.MkdirAll(dir); err != nil {
 		t.Fatal(err)

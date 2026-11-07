@@ -15,9 +15,12 @@ The seek key for "newest version ≤ S" is `(key, S, 0xFF)`.
 
 `u32 payloadLen | u32 crc(payload) | payload`.
 Payload: `u64 ts | uvarint count | repeat(u8 kind, uvarint klen, key,
-uvarint vlen, value)`. Max payload 64 MiB. Replay: a short header/payload or
-CRC mismatch in the LAST WAL is a torn tail (stop and truncate); in an
-earlier WAL it is `ErrCorruption`.
+uvarint vlen, value)`. Max payload 64 MiB. Replay: a short header, declared
+length past EOF, or zero-length tail in the LAST WAL is a torn tail (stop
+and truncate). A complete frame with a bad CRC is `ErrCorruption`, even at
+EOF. Earlier WALs reject torn tails as corruption. Existing zero-tail rules
+are unchanged; the manifest additionally requires all bytes following a
+zero-length header to be zero.
 
 ## SST
 
@@ -49,7 +52,7 @@ earlier WAL it is `ErrCorruption`.
  "add_files":[{"level":0,"num":0,"size":0,"smallest":"","largest":"",
                "min_ts":0,"max_ts":0,"count":0}],
  "del_files":[{"level":0,"num":0}],
- "add_ckpts":[{"file_num":0,"size":0,
+ "add_ckpts":[{"file_num":0,"size":0,"archive_nums":[0],
                "tuples":[{"id":0,"group":"","ts_from":0,"ts_to":0,
                           "offset":0,"length":0}]}],
  "del_ckpts":[0]}
@@ -57,9 +60,36 @@ earlier WAL it is `ErrCorruption`.
 
 Keys are `[]byte` (base64 in JSON). The first record of a new manifest is a
 full snapshot. `CURRENT` holds the manifest file name (written via
-tmp+sync+rename+syncdir). Roll at 4 MiB. **Torn tail**: a short or CRC-broken
-final frame is ignored, like the WAL — see the caveat in ARCHITECTURE.md §8
-(the last committed edit can be silently rolled back).
+tmp+sync+rename+syncdir). Roll at 4 MiB. **Torn tail**: ignore a short
+header, declared length past EOF (unless a valid frame follows), or an
+all-zero tail. A complete frame with a bad CRC is `ErrCorruption`, including
+at EOF; good-CRC frames with invalid JSON are also corruption.
+
+`archive_nums` is additive: new checkpoint records always write an array,
+including `[]` for a known-empty set. JSON decoding and version/snapshot
+copies preserve that distinction. An absent field (or legacy null) on a
+checkpoint with tuples means unknown; readers recover its archive set from
+those tuples for compatibility.
+If any live legacy checkpoint is unreadable, Open skips the entire archive
+orphan sweep and logs the reason.
+
+`Repair(dir, opts)` (CLI: `semlsm --dir DIR repair`) takes the same exclusive
+LOCK as Open. It may truncate a bad-CRC complete final frame in CURRENT's
+manifest or the newest WAL numbered at least the recovered `log_num`.
+Earlier WALs, middle corruption, hidden later valid frames, and bad payloads
+in good-CRC frames are errors. All logs and archive references are checked
+before changes. Unreferenced `.sst`/`.ckpt` files and archive SSTs are moved
+into `lost+found/` (`lost+found/archive/` for archives), with directory syncs;
+existing quarantine names receive numeric suffixes instead of being
+replaced. Quarantine is made durable before the log rollback is published,
+so an interrupted quarantine leaves Open blocked by the damaged frame.
+Repair reports truncated names/bytes dropped and quarantine destinations.
+Open never descends into `lost+found/`.
+
+The crash simulator keeps only a prefix of unsynced bytes, and frame appends
+use one Write. A complete frame with a failed CRC therefore means damage.
+On real disks a non-prefix tear (for example sector reordering) also surfaces
+as `ErrCorruption`; explicit Repair is required to discard that final frame.
 
 ## Checkpoint file (.ckpt)
 
@@ -101,6 +131,17 @@ each record contributes `uvarint klen | key | u64 BE ts | u8 kind |
 uvarint vlen | value`. `base.SourceCRC` computes it; the archive verify path
 recomputes it from the archived records.
 
+## Checkpoint merge publication
+
+Merging uses the same version-1 checkpoint format. Tuple metadata, encoded
+summary and index sections, CRCs, and tuple IDs are copied byte-for-byte after
+verification; directory offsets and the file directory/footer are rewritten.
+The manifest publishes one edit with the new CkptFile (all tuple references
+and the union of archive_nums) and DelCkpts for every input. No archive file
+is rewritten or deleted. Older versions retain the original files until
+snapshots/readers release them. Pre-edit crash outputs are unreferenced and
+swept at Open; a durable edit always keeps its output. No tuple is discarded.
+
 ## Summary JSON (B9)
 
 ```json
@@ -129,7 +170,11 @@ recomputes it from the archived records.
   `model|promptVersion|system|user`; entries carry the model and prompt
   version and are re-checked on hit; size-capped with oldest-first eviction.
 - `archive/%06d.sst` (or `ArchiveDir`) — dropped segments as plain SSTs in
-  internal-key order; referenced only through `TupleMeta.ArchiveFileNum`;
-  unreferenced segments are removed at Open.
+  internal-key order; referenced through `TupleMeta.ArchiveFileNum` and the
+  checkpoint's manifest `archive_nums`. Unreferenced segments are removed
+  at Open only when every live archive set is known. On checkpoint version
+  death, archives are removed using the retained manifest metadata, excluding
+  any still referenced by ANY live version, including snapshot-only checkpoints. Legacy checkpoints require a
+  successful fallback read.
 - Directories are synced (dentry fsync) after every rename/create that must
   survive a crash; the Windows build treats directory fsync as a no-op.

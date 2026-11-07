@@ -4,6 +4,7 @@ package version
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -132,6 +133,14 @@ func (v *Version) HasFile(num uint64) bool {
 	return false
 }
 
+// ObsoleteRecord retains a dying checkpoint's metadata even when its file
+// can no longer be read. Level -1 denotes a checkpoint.
+type ObsoleteRecord struct {
+	Level int
+	Num   uint64
+	Ckpt  *manifest.CkptFile
+}
+
 // VersionSet applies edits and tracks file liveness.
 type VersionSet struct {
 	mu      sync.Mutex
@@ -139,7 +148,9 @@ type VersionSet struct {
 	live    map[uint64]*FileMeta // num -> current instance
 	refs    map[uint64]int64     // num -> live reference count
 	// obsolete lists files whose refcount reached zero (num and level hint).
-	Obsolete    []manifest.DelFile
+	Obsolete    []ObsoleteRecord
+	ckptRefs    map[uint64]int64
+	ckptLive    map[uint64]*manifest.CkptFile
 	NextFileNum uint64
 	LastTs      uint64
 	LogNum      uint64
@@ -148,8 +159,10 @@ type VersionSet struct {
 // NewVersionSet returns an empty set holding one empty version.
 func NewVersionSet() *VersionSet {
 	vs := &VersionSet{
-		live: map[uint64]*FileMeta{},
-		refs: map[uint64]int64{},
+		live:     map[uint64]*FileMeta{},
+		refs:     map[uint64]int64{},
+		ckptRefs: map[uint64]int64{},
+		ckptLive: map[uint64]*manifest.CkptFile{},
 	}
 	v := &Version{Ckpts: &CkptIndex{ByNum: map[uint64]*manifest.CkptFile{}, ByGroup: map[string][]TupleLoc{}}, vs: vs}
 	v.refs.Store(1)
@@ -231,6 +244,10 @@ func (vs *VersionSet) Apply(e *manifest.Edit) (*Version, error) {
 	}
 
 	vs.current = newVersion
+	for num, cf := range newVersion.Ckpts.ByNum {
+		vs.ckptRefs[num]++
+		vs.ckptLive[num] = cf
+	}
 	if old.refs.Add(-1) == 0 {
 		vs.releaseVersionLocked(old)
 	}
@@ -329,6 +346,10 @@ func (vs *VersionSet) buildVersionLocked(old *Version, e *manifest.Edit) (*Versi
 	}
 	for i := range e.AddCkpts {
 		cf := e.AddCkpts[i]
+		cf.Tuples = append([]manifest.TupleRef(nil), cf.Tuples...)
+		if cf.ArchiveNums != nil {
+			cf.ArchiveNums = append([]uint64{}, cf.ArchiveNums...)
+		}
 		newVersion.Ckpts.ByNum[cf.FileNum] = &cf
 	}
 	newVersion.Ckpts.rebuildGroups()
@@ -344,10 +365,18 @@ func (vs *VersionSet) releaseVersionLocked(v *Version) {
 				if dbgTraceObsolete != nil {
 					dbgTraceObsolete(v, fm.Num)
 				}
-				vs.Obsolete = append(vs.Obsolete, manifest.DelFile{Level: fm.Level, Num: fm.Num})
+				vs.Obsolete = append(vs.Obsolete, ObsoleteRecord{Level: fm.Level, Num: fm.Num})
 				delete(vs.live, fm.Num)
 				delete(vs.refs, fm.Num)
 			}
+		}
+	}
+	for num, cf := range v.Ckpts.ByNum {
+		vs.ckptRefs[num]--
+		if vs.ckptRefs[num] == 0 {
+			vs.Obsolete = append(vs.Obsolete, ObsoleteRecord{Level: -1, Num: num, Ckpt: cf})
+			delete(vs.ckptRefs, num)
+			delete(vs.ckptLive, num)
 		}
 	}
 }
@@ -356,11 +385,29 @@ func (vs *VersionSet) releaseVersionLocked(v *Version) {
 var dbgTraceObsolete func(v *Version, num uint64)
 
 // TakeObsolete drains the obsolete list.
-func (vs *VersionSet) TakeObsolete() []manifest.DelFile {
+func (vs *VersionSet) TakeObsolete() []ObsoleteRecord {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	out := vs.Obsolete
 	vs.Obsolete = nil
+	return out
+}
+
+// LiveCheckpoints returns independent metadata copies for checkpoints held by
+// ANY live version, including versions pinned only by snapshots or jobs.
+func (vs *VersionSet) LiveCheckpoints() []manifest.CkptFile {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	out := make([]manifest.CkptFile, 0, len(vs.ckptLive))
+	for _, cf := range vs.ckptLive {
+		copyCF := *cf
+		copyCF.Tuples = append([]manifest.TupleRef(nil), cf.Tuples...)
+		if cf.ArchiveNums != nil {
+			copyCF.ArchiveNums = append([]uint64{}, cf.ArchiveNums...)
+		}
+		out = append(out, copyCF)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FileNum < out[j].FileNum })
 	return out
 }
 
