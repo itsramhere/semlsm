@@ -1,12 +1,15 @@
 package semlsm
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +41,10 @@ func requireIntegrity(t *testing.T, db *DB) {
 	}
 }
 
-func TestRepairManifestQuarantinesRolledBackEdit(t *testing.T) {
+func TestRepairManifestQuarantinesRolledBackEdit(t *testing.T) { repairManifestCase(t, false) }
+func TestAutoRepairManifest(t *testing.T)                      { repairManifestCase(t, true) }
+
+func repairManifestCase(t *testing.T, auto bool) {
 	db, clk, _ := openSemDB(t, "db", llm.NewMock(llm.MockValid), func(o *Options) { o.ArchiveRaw = true })
 	t.Cleanup(func() { db.Close() })
 	var timestamps []uint64
@@ -81,7 +87,33 @@ func TestRepairManifestQuarantinesRolledBackEdit(t *testing.T) {
 		}
 		t.Fatalf("damaged manifest: %v", err)
 	}
-	report, err := Repair("db", opts)
+	var report RepairReport
+	var reopened *DB
+	if auto {
+		opts.AutoRepair = true
+		var log bytes.Buffer
+		opts.Logger = slog.New(slog.NewTextHandler(&log, nil))
+		reopened, err = Open("db", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ok bool
+		report, ok = reopened.RecoveryReport()
+		if !ok || reopened.Stats().RepairsOnOpen != 1 {
+			t.Fatal("automatic repair not reported")
+		}
+		if !strings.Contains(log.String(), "automatic repair on open") {
+			t.Fatal("automatic rollback not logged")
+		}
+		copy, _ := reopened.RecoveryReport()
+		copy.TruncatedFiles[0].Name = "changed"
+		unchanged, _ := reopened.RecoveryReport()
+		if unchanged.TruncatedFiles[0].Name == "changed" {
+			t.Fatal("RecoveryReport exposed mutable state")
+		}
+	} else {
+		report, err = Repair("db", opts)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +149,9 @@ func TestRepairManifestQuarantinesRolledBackEdit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	reopened, err := Open("db", opts)
+	if reopened == nil {
+		reopened, err = Open("db", opts)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +171,10 @@ func TestRepairManifestQuarantinesRolledBackEdit(t *testing.T) {
 	}
 }
 
-func TestRepairLastWAL(t *testing.T) {
+func TestRepairLastWAL(t *testing.T)     { repairWALCase(t, false) }
+func TestAutoRepairLastWAL(t *testing.T) { repairWALCase(t, true) }
+
+func repairWALCase(t *testing.T, auto bool) {
 	fs := newTestMemFS(t)
 	opts := testOptions(fs, base.RealClock{})
 	db, err := Open("db", opts)
@@ -167,16 +204,29 @@ func TestRepairLastWAL(t *testing.T) {
 			t.Fatalf("failed Open leaked: %v", fs.OpenFileNames())
 		}
 	}
-	report, err := Repair("db", opts)
+	var report RepairReport
+	if auto {
+		opts.AutoRepair = true
+		db, err = Open("db", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ok bool
+		report, ok = db.RecoveryReport()
+		if !ok || db.Stats().RepairsOnOpen != 1 {
+			t.Fatal("missing automatic repair report")
+		}
+	} else {
+		report, err = Repair("db", opts)
+		if err == nil {
+			db, err = Open("db", opts)
+		}
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(report.TruncatedFiles, []TruncatedFile{{name, int64(len(data) - off)}}) {
 		t.Fatalf("report: %+v", report)
-	}
-	db, err = Open("db", opts)
-	if err != nil {
-		t.Fatal(err)
 	}
 	defer db.Close()
 	for i := 0; i < 10; i++ {
@@ -193,6 +243,19 @@ func TestRepairLastWAL(t *testing.T) {
 		}
 	}
 	requireIntegrity(t, db)
+	if auto {
+		db.Close()
+		opts.AutoRepair = false
+		clean, err := Open("db", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clean.Close()
+		if _, ok := clean.RecoveryReport(); ok || clean.Stats().RepairsOnOpen != 0 {
+			t.Fatal("clean reopen reported a repair")
+		}
+	}
+
 }
 
 func TestRepairRejectsOtherCorruption(t *testing.T) {
@@ -259,6 +322,13 @@ func TestRepairRejectsOtherCorruption(t *testing.T) {
 				w.Write(append(before, tail...))
 				w.Close()
 				before = hardeningReadFile(t, fs, "db", name)
+				opts.AutoRepair = true
+				if opened, err := Open("db", opts); !errors.Is(err, ErrCorruption) {
+					if opened != nil {
+						opened.Close()
+					}
+					t.Fatalf("AutoRepair accepted other corruption: %v", err)
+				}
 				if _, err := Repair("db", opts); !errors.Is(err, ErrCorruption) {
 					t.Fatalf("repair: %v", err)
 				}

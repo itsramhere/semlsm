@@ -5,11 +5,87 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"semlsm/internal/base"
 	"semlsm/internal/testutil"
 )
+
+func TestRewriteTupleRetentionPreservesSections(t *testing.T) {
+	fs := testutil.NewMemFS(t)
+	w, err := NewWriter(fs, "old.ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := TupleMeta{ID: 1, Group: "g/", TsFrom: 1000, TsTo: 1200, SourceCount: 200, SourceCRC32: 42, PrevTupleID: 7, ArchiveFileNum: 9}
+	entries := mkEntries(20)
+	if err := w.AddTuple(meta, []byte(`{ "summary": "keep these exact bytes" }`), entries); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenReader(fs, "old.ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	original, err := r.tupleBytes(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections := func(raw []byte) ([]byte, []byte) {
+		pos := 4 + int(binary.LittleEndian.Uint32(raw)) + 4
+		end := pos + 4 + int(binary.LittleEndian.Uint32(raw[pos:]))
+		return raw[pos:end], raw[end:]
+	}
+	origSum, origIndex := sections(original)
+	for _, stub := range []bool{false, true} {
+		path := fmt.Sprintf("new-%v.ckpt", stub)
+		writer, err := NewWriter(fs, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed := meta
+		changed.ArchiveFileNum = 0
+		changed.ArchiveRetiredUnixNano = 10000
+		if stub {
+			changed.RetiredUnixNano = 20000
+		}
+		if _, err := writer.RewriteTuple(r, 1, changed, stub); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Finish(); err != nil {
+			t.Fatal(err)
+		}
+		out, err := OpenReader(fs, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := out.tupleBytes(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum, index := sections(raw)
+		if !bytes.Equal(origIndex, index) || !stub && !bytes.Equal(origSum, sum) {
+			t.Fatal("encoded section changed")
+		}
+		got, err := out.ReadMeta(1)
+		if err != nil || got != changed {
+			t.Fatalf("metadata: %+v %v", got, err)
+		}
+		keys, err := out.IterKeys(1)
+		if err != nil || !reflect.DeepEqual(keys, entries) {
+			t.Fatalf("stub lost key ranges: %v", err)
+		}
+		payload, err := out.ReadSummary(1)
+		if err != nil || stub && len(payload) != 0 {
+			t.Fatalf("stub payload remains: %q %v", payload, err)
+		}
+		out.Close()
+	}
+}
 
 func TestCopyTuplePreservesBytesAndChecksCRCs(t *testing.T) {
 	fs := testutil.NewMemFS(t)

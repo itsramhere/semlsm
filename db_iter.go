@@ -136,6 +136,13 @@ func (it *Iterator) collectEntries() {
 				}
 				continue
 			}
+			meta, err := r.ReadMeta(ref.ID)
+			if err != nil {
+				if it.err == nil {
+					it.err = err
+				}
+				continue
+			}
 			for _, ke := range keys {
 				if len(it.start) > 0 && base.CompareUser(ke.Key, it.start) < 0 {
 					continue
@@ -145,7 +152,7 @@ func (it *Iterator) collectEntries() {
 				}
 				it.entries = append(it.entries, iterEntry{
 					key:  string(ke.Key),
-					e:    resolve.Entry{Found: true, MinTs: ke.MinTs, MaxTs: ke.MaxTs, Count: ke.Count, LastKind: ke.LastKind},
+					e:    resolve.Entry{Found: true, MinTs: ke.MinTs, MaxTs: ke.MaxTs, Count: ke.Count, LastKind: ke.LastKind, Retired: meta.RetiredUnixNano != 0},
 					file: num,
 					id:   ref.ID,
 				})
@@ -214,7 +221,7 @@ func (it *Iterator) nextKey() bool {
 		if it.collapsedTuple != 0 {
 			if best, ok := it.bestEntry(key); ok && best.id == it.collapsedTuple {
 				r := resolve.Resolve(it.s, it.rawAt(key), best.e)
-				if r == resolve.UseSummary || r == resolve.NotFound {
+				if r == resolve.UseSummary || r == resolve.NotFound || r == resolve.UseExpired {
 					it.skipKeyRaw(key)
 					it.skipKeyEntries(key)
 					continue
@@ -244,7 +251,7 @@ func (it *Iterator) nextKey() bool {
 			}
 			it.valid = true
 			return true
-		case resolve.UseSummary:
+		case resolve.UseSummary, resolve.UseExpired:
 			if !hasBest {
 				it.err = fmt.Errorf("semlsm: UseSummary without an entry for key %q", key)
 				it.valid = false
@@ -260,6 +267,9 @@ func (it *Iterator) nextKey() bool {
 				Kind:       ResultSummarized,
 				Key:        []byte(key),
 				Checkpoint: info,
+			}
+			if info.RetiredUnixNano != 0 {
+				it.current.Kind = ResultExpired
 			}
 			if it.collapse {
 				it.collapsedTuple = best.id

@@ -46,8 +46,16 @@ func TestResolveTruthTable(t *testing.T) {
 		{"s equals MaxTs", 30, none, entry, UseSummary},
 	}
 	for _, tt := range tests {
-		if got := Resolve(tt.s, tt.r, tt.e); got != tt.want {
-			t.Errorf("%s: got %d want %d", tt.name, got, tt.want)
+		for _, retired := range []bool{false, true} {
+			e := tt.e
+			e.Retired = retired
+			want := tt.want
+			if retired && want == UseSummary {
+				want = UseExpired
+			}
+			if got := Resolve(tt.s, tt.r, e); got != want {
+				t.Errorf("%s (retired=%t): got %d want %d", tt.name, retired, got, want)
+			}
 		}
 	}
 }
@@ -61,5 +69,34 @@ func TestResolveRows7Boundary(t *testing.T) {
 	}
 	if got := Resolve(30, Raw{}, e); got != NotFound {
 		t.Fatalf("s == MaxTs with delete tail: got %d, want NotFound", got)
+	}
+}
+
+func TestRetiredEntryTruthTable(t *testing.T) {
+	e := Entry{Found: true, MinTs: 20, MaxTs: 30, LastKind: base.KindPut, Retired: true}
+	for _, kind := range []base.Kind{base.KindPut, base.KindDelete} {
+		e.LastKind = kind
+		for _, s := range []uint64{20, 25, 30, 35} {
+			for _, raw := range []Raw{{}, {Found: true, Ts: 10, Kind: base.KindPut}} {
+				live := e
+				live.Retired = false
+				want := Resolve(s, raw, live)
+				if want == UseSummary {
+					want = UseExpired
+				}
+				if got := Resolve(s, raw, e); got != want {
+					t.Fatalf("retired range at %d, last kind %d: got %d want %d", s, kind, got, want)
+				}
+			}
+		}
+	}
+	if got := Resolve(40, Raw{Found: true, Ts: 40, Kind: base.KindPut}, e); got != UseRaw {
+		t.Fatalf("newer put: %d", got)
+	}
+	if got := Resolve(40, Raw{Found: true, Ts: 40, Kind: base.KindDelete}, e); got != NotFound {
+		t.Fatalf("newer delete: %d", got)
+	}
+	if got := Resolve(25, Raw{Found: true, Ts: 25, Kind: base.KindPut}, e); got != Invariant {
+		t.Fatalf("stub hid I7: %d", got)
 	}
 }

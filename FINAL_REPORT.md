@@ -123,27 +123,26 @@ integrity problems.
 
 ## Known limitations
 
-Briefs A and B address all four listed implementation limitations. Complete
-CRC-broken tails require explicit Repair; archive metadata and all-version
-liveness protect deletion; MemFS tests check handles; checkpoint merges bound
-file count. Final verification: `gofmt -l .` is empty, `go vet ./...` is clean,
-and `go test -count=1 -race -timeout 900s ./...` passes every package (root
-249.175s). File changes and design details are reported in the final
-conversation message.
+Briefs A-C address the known implementation limitations. Verification results
+and changed files for Brief C are reported in the final conversation message.
 
-- Real-disk non-prefix tears (for example sector reordering) surface as
-  `ErrCorruption` when a complete frame fails CRC. Explicit `Repair` can
-  discard only the damaged final manifest/newest eligible WAL frame and
-  quarantines unreferenced data files in `lost+found/`. Prefix tears remain
-  tolerated; complete final CRC damage no longer rolls back silently.
-- Checkpoint merging now bounds file count (default threshold 32; configurable
-  or manually triggered). Tuples and summaries are retained byte-for-byte;
-  tuple retention / dropping old summaries is still not implemented.
-  Archive deletion uses the dying version's retained manifest archive
-  numbers and preserves archives referenced by any live version. An
-  unreadable legacy checkpoint without archive metadata still requires a
-  fallback read; if its live archive set is unknown, Open logs and skips all
-  archive deletion rather than risking data loss.
+- Damaged complete final frames still surface as ErrCorruption by default.
+  Repair quarantines orphaned data before rolling back that frame. Runtime
+  Options.AutoRepair can now do the same under Open's existing lock, logging
+  a Warn and exposing RecoveryReport / RepairsOnOpen. This opt-in trades
+  operator review for automatic rollback of the final damaged edit/write;
+  other corruption still fails Open. Real-disk non-prefix tears are therefore
+  explicit or opt-in repair events rather than silently ignored CRC failures.
+- Checkpoint merging bounds file count. ArchiveRetention can release old
+  archives while preserving summaries; SummaryRetention turns old tuples into
+  stubs with full key ranges, identity/counts and predecessor links. Those
+  fences prevent stale older raw values (I10), answering ResultExpired.
+  Retention shares the crash-safe rewrite path with merging, and snapshots
+  retain old summaries/archives until released. Defaults keep content forever.
+  Stub metadata/key ranges remain intentionally retained; payloads and archives
+  can now be retired. Unreadable legacy archive sets still disable archive
+  deletion conservatively.
+
 - MemFS now exposes open handle counts and sorted names, and root/internal
   test fixtures check for leaked handles after use. Crash clones inherit
   neither handles nor locks. This complements the existing Windows checks.

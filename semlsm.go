@@ -36,6 +36,7 @@ var (
 	ErrFutureTimestamp = base.ErrFutureTimestamp
 	ErrOptionsMismatch = base.ErrOptionsMismatch
 	ErrNotArchived     = base.ErrNotArchived
+	ErrArchiveRetired  = base.ErrArchiveRetired
 	ErrKeyEmpty        = base.ErrKeyEmpty
 	ErrKeyTooLarge     = base.ErrKeyTooLarge
 	ErrValueTooLarge   = base.ErrValueTooLarge
@@ -61,6 +62,8 @@ type Stats struct {
 	LevelBytes            [base.NumLevels]int64
 	CompactionErrors      uint64 // failed compaction attempts since Open (M-015 item 6)
 	CheckpointMerges      uint64
+	RepairsOnOpen         uint64
+	RetentionPasses       uint64
 	CheckpointFilesMerged uint64 // number of input files rewritten by merges
 
 	// Tier B semantic accounting (P10.3).
@@ -113,7 +116,9 @@ type DB struct {
 	dir  string
 	opts Options
 
-	lockH vfs.LockHandle
+	lockH          vfs.LockHandle
+	recoveryReport RepairReport // immutable after Open
+	repairsOnOpen  uint64
 
 	// mu guards the read-state pointer, visibleTs, queues, and scheduling
 	// state. Never held over I/O or LLM calls (B7).
@@ -172,6 +177,8 @@ type DB struct {
 	ckptMergeWG         sync.WaitGroup // registrations under mu, before Close closes admission
 	ckptMerges          atomic.Uint64
 	ckptFilesMerged     atomic.Uint64
+	retentionPasses     atomic.Uint64
+	lastRetention       time.Time       // guarded by mu; attempts use Options.Clock
 	busy                map[uint64]bool // file numbers used by running compactions
 
 	// Tier B semantic state (P10.2). semJobs is guarded by mu; the counters
@@ -251,17 +258,21 @@ func Open(dir string, opts Options) (*DB, error) {
 	db.nextTry = map[uint64]time.Time{}
 	db.semFail = map[string]uint64{}
 	db.semJobsOut = map[string]uint64{}
-	if err := db.openRecover(); err != nil {
+	err = db.openRecover()
+	if err != nil && opts.AutoRepair && errors.Is(err, wal.ErrFinalFrameCRC) {
+		db.closeRecoveryFiles()
+		report, repairErr := repairLocked(dir, opts)
+		db.logger.Warn("semlsm: automatic repair on open", "report", report, "err", repairErr)
+		if repairErr != nil {
+			err = fmt.Errorf("semlsm: automatic repair: %w", repairErr)
+		} else {
+			db.recoveryReport, db.repairsOnOpen = report, 1
+			err = db.openRecover()
+		}
+	}
+	if err != nil {
 		// Recovery may have opened writers before a later WAL or I/O error.
-		if db.wal != nil {
-			_ = db.wal.Close()
-		}
-		if db.manifest != nil {
-			_ = db.manifest.Close()
-		}
-		if db.rs != nil {
-			db.rs.release()
-		}
+		db.closeRecoveryFiles()
 		_ = lockH.Unlock()
 		return nil, err
 	}
@@ -277,6 +288,22 @@ func Open(dir string, opts Options) (*DB, error) {
 	db.startCompactionWorkers()
 
 	return db, nil
+}
+
+func (db *DB) closeRecoveryFiles() {
+	if db.wal != nil {
+		_ = db.wal.Close()
+		db.wal = nil
+	}
+	if db.manifest != nil {
+		_ = db.manifest.Close()
+		db.manifest = nil
+	}
+	if db.rs != nil {
+		db.rs.release()
+		db.rs = nil
+	}
+	db.manifestNum, db.walNum, db.nextFileNum = 0, 0, 0
 }
 
 // allocateFileNum returns the next file number (manifestMu must be held).
@@ -326,7 +353,7 @@ func (db *DB) openRecover() error {
 	for i, num := range replayNums {
 		last := i == len(replayNums)-1
 		var validBytes int64
-		validBytes, err = wal.Replay(db.opts.FS, filepath.Join(db.dir, walName(num)), last, func(payload []byte) error {
+		apply := func(payload []byte) error {
 			_, recs, derr := wal.DecodeBatch(payload)
 			if derr != nil {
 				return derr
@@ -339,7 +366,15 @@ func (db *DB) openRecover() error {
 				recoverCount++
 			}
 			return nil
-		})
+		}
+		path := filepath.Join(db.dir, walName(num))
+		if last && db.opts.AutoRepair {
+			// Match Repair's conservative validation before any automatic
+			// rollback: a damaged length must not hide later valid frames.
+			validBytes, err = wal.ReplayStrict(db.opts.FS, path, apply)
+		} else {
+			validBytes, err = wal.Replay(db.opts.FS, path, last, apply)
+		}
 		if err != nil {
 			return fmt.Errorf("semlsm: replay wal %d: %w", num, err)
 		}
@@ -829,6 +864,8 @@ func (db *DB) Stats() Stats {
 	s.SnapshotsOpen = int(db.snapshotsOpen.Load())
 	s.CompactionErrors = db.compactErrs.Load()
 	s.CheckpointMerges = db.ckptMerges.Load()
+	s.RepairsOnOpen = db.repairsOnOpen
+	s.RetentionPasses = db.retentionPasses.Load()
 	s.CheckpointFilesMerged = db.ckptFilesMerged.Load()
 
 	// Tier B accounting (P10.3). LLM health comes from the stack's live

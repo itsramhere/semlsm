@@ -1,6 +1,9 @@
 package base
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Sentinel errors. Re-exported from the root semlsm package.
 var (
@@ -14,7 +17,8 @@ var (
 	// ErrOptionsMismatch is returned when OPTIONS.json group settings differ on reopen.
 	ErrOptionsMismatch = errors.New("semlsm: options mismatch with existing database")
 	// ErrNotArchived is returned by GetArchived when no archive copy exists.
-	ErrNotArchived = errors.New("semlsm: raw version not archived")
+	ErrNotArchived    = errors.New("semlsm: raw version not archived")
+	ErrArchiveRetired = fmt.Errorf("semlsm: archive retired: %w", ErrNotArchived)
 	// ErrKeyEmpty is returned when a Put/Delete/Get receives an empty key.
 	ErrKeyEmpty = errors.New("semlsm: key is empty")
 	// ErrKeyTooLarge is returned when a key exceeds MaxKeyBytes.

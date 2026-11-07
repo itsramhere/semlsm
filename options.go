@@ -45,8 +45,9 @@ type Policy = base.Policy
 
 // Options configures Open. Zero fields take their defaults from withDefaults.
 type Options struct {
-	FS    vfs.FS
-	Clock base.Clock
+	FS         vfs.FS
+	Clock      base.Clock
+	AutoRepair bool // opt in to quarantining and rolling back damaged final log frames
 
 	SyncMode   SyncMode
 	SyncEveryN int
@@ -74,6 +75,9 @@ type Options struct {
 	SemanticSweepInterval time.Duration  // 10 min
 	MinCompressionRatio   float64        // 5.0
 	CkptMergeThreshold    int            // 32; negative disables automatic merging
+	ArchiveRetention      time.Duration  // 0 keeps archives forever
+	SummaryRetention      time.Duration  // 0 keeps summaries forever
+	RetentionInterval     time.Duration  // 1h between automatic retention attempts
 
 	ArchiveRaw      bool
 	ArchiveDir      string
@@ -171,6 +175,9 @@ func (o Options) withDefaults() (Options, error) {
 	if o.CkptMergeThreshold == 0 {
 		o.CkptMergeThreshold = 32
 	}
+	if o.RetentionInterval == 0 {
+		o.RetentionInterval = time.Hour
+	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
@@ -193,6 +200,12 @@ func (o Options) withDefaults() (Options, error) {
 }
 
 func (o Options) validate() error {
+	if o.ArchiveRetention < 0 || o.SummaryRetention < 0 || o.RetentionInterval < 0 {
+		return fmt.Errorf("options: retention durations must be non-negative")
+	}
+	if o.ArchiveRetention != 0 && o.SummaryRetention != 0 && o.ArchiveRetention > o.SummaryRetention {
+		return fmt.Errorf("options: ArchiveRetention must be <= SummaryRetention")
+	}
 	if o.L0StallTrigger < o.L0CompactTrigger {
 		return fmt.Errorf("options: L0StallTrigger (%d) < L0CompactTrigger (%d)", o.L0StallTrigger, o.L0CompactTrigger)
 	}

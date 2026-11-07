@@ -86,10 +86,20 @@ so an interrupted quarantine leaves Open blocked by the damaged frame.
 Repair reports truncated names/bytes dropped and quarantine destinations.
 Open never descends into `lost+found/`.
 
+AutoRepair is a runtime opt-in (default false): Open shares repairLocked with
+Repair under the LOCK it already holds, closes recovery handles, quarantines,
+truncates, and retries. With AutoRepair, the newest WAL uses Repair's strict validation.
+Only ErrFinalFrameCRC is repairable; bad JSON or damage
+with later valid frames remains an error. A Warn and RecoveryReport expose the
+rollback, and Stats.RepairsOnOpen counts it. --auto-repair enables this in the
+CLI. The trade-off is automatic loss of the damaged final edit/write instead
+of an operator-approved rollback. No AutoRepair setting is persisted.
+
+
 The crash simulator keeps only a prefix of unsynced bytes, and frame appends
 use one Write. A complete frame with a failed CRC therefore means damage.
 On real disks a non-prefix tear (for example sector reordering) also surfaces
-as `ErrCorruption`; explicit Repair is required to discard that final frame.
+as `ErrCorruption`; explicit Repair or opt-in AutoRepair can discard that final frame.
 
 ## Checkpoint file (.ckpt)
 
@@ -116,6 +126,8 @@ type TupleMeta struct {
     Model string; PromptVersion int; CreatedUnixNano int64
     PrevTupleID uint64    // previous tuple in the group (largest existing id at commit)
     ArchiveFileNum uint64 // 0 = no archive
+    RetiredUnixNano int64 // JSON retired_unix_nano, omitted/0 = live summary
+    ArchiveRetiredUnixNano int64 // JSON archive_retired_unix_nano, omitted/0 = not released
     InputTokens, OutputTokens uint64
     Degraded bool // always false in this version
 }
@@ -131,16 +143,38 @@ each record contributes `uvarint klen | key | u64 BE ts | u8 kind |
 uvarint vlen | value`. `base.SourceCRC` computes it; the archive verify path
 recomputes it from the archived records.
 
+## Retired tuple stubs
+
+The checkpoint version stays 1. Two optional metadata JSON fields are additive:
+retired_unix_nano and archive_retired_unix_nano (int64, absent decodes as 0).
+A summary-retired stub keeps all identity/count/range/predecessor metadata and
+its complete encoded key index. ArchiveFileNum becomes 0. Its summary section
+encodes an empty payload (u32 section length 5, codec 0 and CRC), rather than
+summary JSON. Archive-only retirement preserves the original summary bytes.
+
+Metadata and key-index CRCs remain mandatory; stub readers skip the unavailable
+summary payload and its CRC. VerifyIntegrity retains I7 and tuple-chain checks,
+counts stubs and archive-retired tuples, and skips their unavailable content.
+ResultExpired is appended after existing ResultKind values; it carries tuple
+and key-range information in CheckpointInfo with VersionTs 0. A retained range
+continues to mask older raw data, preventing stale Exact answers (I10).
+
+A retention rewrite atomically swaps affected files through AddCkpts/DelCkpts,
+just like a merge. Untouched tuples remain byte-identical. Its archive_nums
+array is rebuilt from surviving tuple references so released segments die when
+no live version pins them. Stubs are never removed or un-retired. Unchanged
+files are not rewritten. Runtime retention durations use Options.Clock and
+are not stored in OPTIONS.json; automatic attempts default to a 1h interval.
+
 ## Checkpoint merge publication
 
 Merging uses the same version-1 checkpoint format. Tuple metadata, encoded
 summary and index sections, CRCs, and tuple IDs are copied byte-for-byte after
 verification; directory offsets and the file directory/footer are rewritten.
 The manifest publishes one edit with the new CkptFile (all tuple references
-and the union of archive_nums) and DelCkpts for every input. No archive file
-is rewritten or deleted. Older versions retain the original files until
+and the union of archive_nums) and DelCkpts for every input. A pure merge rewrites or deletes no archive file. Older versions retain the original files until
 snapshots/readers release them. Pre-edit crash outputs are unreferenced and
-swept at Open; a durable edit always keeps its output. No tuple is discarded.
+swept at Open; a durable edit always keeps its output. Retention may remove payloads, but tuple range fences are never discarded.
 
 ## Summary JSON (B9)
 

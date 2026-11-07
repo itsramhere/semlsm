@@ -14,6 +14,106 @@ import (
 	"semlsm/internal/vfs"
 )
 
+func TestCLIAutoRepairGolden(t *testing.T) {
+	dir := t.TempDir()
+	var out, stderr bytes.Buffer
+	for _, value := range []string{"before", "damaged"} {
+		if code := run([]string{"--dir", dir, "put", "agent/1/k", value}, &out, &stderr); code != 0 {
+			t.Fatalf("put: %d %s", code, stderr.String())
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var newest string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".wal") && entry.Name() > newest {
+			newest = entry.Name()
+		}
+	}
+	path := filepath.Join(dir, newest)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-1] ^= 1
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	stderr.Reset()
+	if code := run([]string{"--dir", dir, "get", "agent/1/k"}, &out, &stderr); code != 1 {
+		t.Fatal("unrequested repair succeeded")
+	}
+	out.Reset()
+	stderr.Reset()
+	if code := run([]string{"--auto-repair", "--dir", dir, "get", "agent/1/k"}, &out, &stderr); code != 0 {
+		t.Fatalf("auto repair: %d %s", code, stderr.String())
+	}
+	if strings.Split(out.String(), " @")[0] != "before" || !strings.Contains(stderr.String(), "automatic repair on open") {
+		t.Fatalf("auto repair golden: %q %q", out.String(), stderr.String())
+	}
+}
+
+func TestCLIRetentionGolden(t *testing.T) {
+	dir := t.TempDir()
+	var out, stderr bytes.Buffer
+	if code := run([]string{"--dir", dir, "put", "other/raw", "head"}, &out, &stderr); code != 0 {
+		t.Fatalf("create: %d %s", code, stderr.String())
+	}
+	fs := vfs.OSFS{}
+	name, err := manifest.ReadCurrent(fs, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edits, err := manifest.ReadAll(fs, filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := checkpoint.NewWriter(fs, filepath.Join(dir, "001000.ckpt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := checkpoint.TupleMeta{ID: 2000, Group: "agent/1/", TsFrom: 1, TsTo: 10, SourceCount: 10, KeyCount: 1, PutCount: 10}
+	if err := w.AddTuple(meta, []byte(`{"Narrative":{"Summary":"kept"}}`), []checkpoint.KeyEntry{{Key: []byte("agent/1/k"), MinTs: 1, MaxTs: 10, Count: 10, LastKind: base.KindPut}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	loc := w.DirEntries()[0]
+	edits = append(edits, manifest.Edit{NextFileNum: 3000, AddCkpts: []manifest.CkptFile{{FileNum: 1000, ArchiveNums: []uint64{}, Tuples: []manifest.TupleRef{{ID: 2000, Group: meta.Group, TsFrom: 1, TsTo: 10, Offset: loc.Offset, Length: loc.Length}}}}})
+	mw, err := manifest.NewWriter(fs, filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edit := range edits {
+		if err := mw.Append(&edit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mw.Close()
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"get", "agent/1/k", "--at", "5"}, "<summarized tuple 2000 group agent/1/ ts 1..10 count 10> kept\n"},
+		{[]string{"compact", "--retention", "--summary-retention", "1ns"}, "retention applied\n"},
+		{[]string{"get", "agent/1/k", "--at", "5"}, "<expired tuple 2000 group agent/1/ ts 1..10>\n"},
+		{[]string{"scan", "--start", "agent/", "--end", "agent/2"}, "agent/1/k\t<expired tuple 2000 ts 1..10>\n"},
+		{[]string{"history", "agent/1/k"}, "@1..10 EXPIRED tuple 2000 (10 versions)\n"},
+	}
+	for _, tc := range cases {
+		out.Reset()
+		stderr.Reset()
+		code := run(append([]string{"--dir", dir}, tc.args...), &out, &stderr)
+		if code != 0 || out.String() != tc.want || stderr.Len() != 0 {
+			t.Fatalf("%v: %d %q %q want %q", tc.args, code, out.String(), stderr.String(), tc.want)
+		}
+	}
+}
+
 func TestCLICompactCheckpointsGolden(t *testing.T) {
 	dir := t.TempDir()
 	var out, stderr bytes.Buffer

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"time"
 
@@ -27,11 +28,13 @@ func main() {
 // (0 ok, 1 on any error). Separated from main for golden tests.
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: semlsm [--dir DIR] [--llm] <command> [args]")
+		fmt.Fprintln(stderr, "usage: semlsm [--dir DIR] [--llm] [--auto-repair] <command> [args]")
 		return 1
 	}
 	dir := "semlsm-data"
 	useLLM := false
+	autoRepair := false
+	var archiveRetention, summaryRetention time.Duration
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -44,12 +47,31 @@ func run(args []string, stdout, stderr io.Writer) int {
 			dir = args[i]
 		case "--llm":
 			useLLM = true
+		case "--auto-repair":
+			autoRepair = true
+		case "--archive-retention", "--summary-retention":
+			name := args[i]
+			if i+1 >= len(args) {
+				fmt.Fprintf(stderr, "%s needs a duration\n", name)
+				return 1
+			}
+			i++
+			age, err := time.ParseDuration(args[i])
+			if err != nil {
+				fmt.Fprintf(stderr, "%s: %v\n", name, err)
+				return 1
+			}
+			if name == "--archive-retention" {
+				archiveRetention = age
+			} else {
+				summaryRetention = age
+			}
 		default:
 			rest = append(rest, args[i])
 		}
 	}
 	if len(rest) == 0 {
-		fmt.Fprintln(stderr, "usage: semlsm [--dir DIR] [--llm] <command> [args]")
+		fmt.Fprintln(stderr, "usage: semlsm [--dir DIR] [--llm] [--auto-repair] <command> [args]")
 		return 1
 	}
 
@@ -72,6 +94,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "semlsm: %v\n", err)
 		return 1
+	}
+	opts.AutoRepair = autoRepair
+	opts.ArchiveRetention, opts.SummaryRetention = archiveRetention, summaryRetention
+	if autoRepair {
+		opts.Logger = slog.New(slog.NewTextHandler(stderr, nil))
 	}
 	db, err := semlsm.Open(dir, opts)
 	if err != nil {
@@ -139,8 +166,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs.SetOutput(stderr)
 		level := fs.Int("level", -1, "level to compact")
 		checkpoints := fs.Bool("checkpoints", false, "merge checkpoint files")
+		retention := fs.Bool("retention", false, "apply tuple retention")
 		if err := fs.Parse(args2); err != nil {
 			return 1
+		}
+		if *retention {
+			if err := db.ApplyRetention(context.Background()); err != nil {
+				fmt.Fprintf(stderr, "semlsm: retention: %v\n", err)
+				return 1
+			}
+			fmt.Fprintln(stdout, "retention applied")
+			return 0
 		}
 		if *checkpoints {
 			if err := db.CompactCheckpoints(context.Background()); err != nil {
@@ -151,7 +187,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 0
 		}
 		if *level < 0 {
-			fmt.Fprintln(stderr, "usage: semlsm compact --level N | --checkpoints")
+			fmt.Fprintln(stderr, "usage: semlsm compact --level N | --checkpoints | --retention [--archive-retention AGE] [--summary-retention AGE]")
 			return 1
 		}
 		if err := db.CompactLevel(context.Background(), *level); err != nil {
@@ -199,6 +235,9 @@ func cmdGet(db *semlsm.DB, args []string, stdout, stderr io.Writer) int {
 		c := res.Checkpoint
 		fmt.Fprintf(stdout, "<summarized tuple %d group %s ts %d..%d count %d> %s\n",
 			c.ID, c.Group, c.TsFrom, c.TsTo, c.SourceCount, c.Summary.Narrative.Summary)
+	case semlsm.ResultExpired:
+		c := res.Checkpoint
+		fmt.Fprintf(stdout, "<expired tuple %d group %s ts %d..%d>\n", c.ID, c.Group, c.TsFrom, c.TsTo)
 	}
 	return 0
 }
@@ -226,6 +265,9 @@ func cmdScan(db *semlsm.DB, args []string, stdout, stderr io.Writer) int {
 		case semlsm.ResultSummarized:
 			c := r.Checkpoint
 			fmt.Fprintf(stdout, "%s\t<summarized tuple %d ts %d..%d>\n", r.Key, c.ID, c.TsFrom, c.TsTo)
+		case semlsm.ResultExpired:
+			c := r.Checkpoint
+			fmt.Fprintf(stdout, "%s\t<expired tuple %d ts %d..%d>\n", r.Key, c.ID, c.TsFrom, c.TsTo)
 		}
 	}
 	if err := it.Err(); err != nil {
@@ -268,6 +310,10 @@ func cmdHistory(db *semlsm.DB, args []string, stdout, stderr io.Writer) int {
 			continue
 		}
 		c := it.Checkpoint
+		if c.RetiredUnixNano != 0 {
+			fmt.Fprintf(stdout, "@%d..%d EXPIRED tuple %d (%d versions)\n", c.KeyMinTs, c.KeyMaxTs, c.ID, c.KeyCount)
+			continue
+		}
 		fmt.Fprintf(stdout, "@%d..%d SUMMARIZED tuple %d (%d versions) %s\n",
 			c.KeyMinTs, c.KeyMaxTs, c.ID, c.KeyCount, c.Summary.Narrative.Summary)
 	}

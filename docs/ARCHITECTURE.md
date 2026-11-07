@@ -40,6 +40,23 @@ surfaces as `ErrCorruption`. The iterator performs the same resolution per
 key, merging the raw stream with tuple key entries;
 `CollapseSummaries` emits each tuple once at its first key.
 
+
+The checkpoint entry is the eligible one with largest MinTs <= S:
+
+| Raw candidate | Checkpoint entry | Result |
+|---|---|---|
+| Absent | Absent | NotFound |
+| Put / delete | Absent | Exact / NotFound |
+| Newer than entry.MaxTs, put / delete | Live or retired | Exact / NotFound |
+| Inside [entry.MinTs, entry.MaxTs] | Live or retired | ErrCorruption (I7) |
+| Absent or older | Live or retired, delete tail visible at S >= MaxTs | NotFound |
+| Absent or older than entry.MinTs | Other retired stub | Expired (tuple ID/range, no value) |
+| Absent or older | Other live entry | Summarized |
+
+GetAt and iterators both use this truth table. GetArchived returns
+ErrArchiveRetired (wrapping ErrNotArchived) for a stub or released archive
+within its run; beyond the run it delegates to GetAt, including newer raw data.
+
 ## 4. Semantic jobs (P10)
 
 `RunSemantic` executes plan steps 3–9 with **no engine locks held** (I11):
@@ -104,8 +121,48 @@ archives during input version death. Snapshot Get, iteration, and
 GetArchived continue using the original pinned version. Close stops new
 merge admission and waits for in-flight manual and background merges.
 
-Merges retain every tuple and summary. They bound file count; they do not
-implement tuple retention or shrink historical summary contents.
+Merges preserve untouched tuple bytes. Retention shares the same rewrite
+admission, version pin, busy reservations, manifest publication, and cleanup.
+
+### Tuple retention
+
+ArchiveRetention and SummaryRetention are independent runtime durations; zero
+keeps that content forever. If both are enabled, ArchiveRetention must not
+exceed SummaryRetention. The fast loop attempts retention at most once per
+RetentionInterval (default 1h), using Options.Clock. An explicit
+DB.ApplyRetention(ctx) ignores that interval. Disabled knobs do no work;
+unchanged files and already-retired tuples are never rewritten.
+
+A tuple is due only when TsTo is strictly older than now minus its retention
+age (all timestamps are clock nanoseconds). Archive retirement clears
+ArchiveFileNum and records archive_retired_unix_nano, preserving summary and
+encoded key-index bytes. Summary retirement records retired_unix_nano, removes
+the summary payload, and also releases any archive. Earlier archive retirement
+times are preserved. Retired stubs cannot be un-retired by changing options.
+
+A stub keeps its identity, range, counts, SourceCRC32, PrevTupleID, and full
+key index. Removing those ranges would expose older raw generations (I10).
+Instead the resolve layer returns ResultExpired with tuple/range metadata,
+zero VersionTs, and no value. Raw data newer than the range still wins.
+
+Eligible checkpoint files are scanned and transformed outside engine locks.
+A pass writes one replacement for affected inputs; untouched tuples are copied
+byte-for-byte, and the output archive set excludes released segments. One
+manifest edit swaps the files after membership and busy checks. All live
+versions, including snapshots and jobs, protect old checkpoints and archives
+until final release. Snapshots pinned before retirement keep their original
+Summarized and GetArchived results. retention.after_write and
+retention.after_manifest exercise the same crash/error boundaries as merging,
+including failed-manifest-sync rollback. Close waits for both kinds of rewrite.
+
+VerifyIntegrity counts Stubs and ArchiveRetiredTuples. It skips unavailable
+summary/archive checks, retaining metadata/index CRC checks, I7 ranges, and
+predecessor-chain checks. The lazy checkpoint tuple cache is mutex-protected
+for concurrent point reads, iteration, and verification.
+
+CLI: compact --retention, with optional global --archive-retention AGE and
+--summary-retention AGE (for example 24h and 720h). Policies are not persisted.
+get, scan, and history display Expired instead of a summary for stub ranges.
 
 ## 5. Reliability layers (P9)
 
@@ -159,6 +216,20 @@ preceding version, moves every unreferenced data file into `lost+found/`
 and syncs the damaged logs. It never deletes data files or overwrites an
 existing quarantine entry. A following Open ignores `lost+found/` entirely.
 
+Options.AutoRepair defaults to false and is not persisted in OPTIONS.json.
+When enabled, only wal.ErrFinalFrameCRC triggers the shared repairLocked path
+under Open's existing LOCK, after recovery handles are closed. With AutoRepair,
+the newest WAL uses Repair's strict validation to reject damaged lengths
+hiding later valid frames. Without it, existing WAL replay rules are unchanged.
+Quarantine is
+synced before truncation, then normal recovery restarts. Other corruption
+still fails Open. Automatic rollback is opt-in: it can discard the final edit
+or write without waiting for operator review, but logs a Warn with the report.
+DB.RecoveryReport returns independent report copies and whether this Open
+repaired anything; Stats.RepairsOnOpen counts the repair invocation. The CLI
+--auto-repair flag enables this behavior and writes the warning to stderr.
+
+
 Each checkpoint's manifest record carries `archive_nums`. Version membership
 counts keep checkpoints alive across snapshots; the obsolete record retains
 the dying version's checkpoint metadata. Archive deletion uses those numbers
@@ -178,7 +249,9 @@ for zero handles after DB, cache, and stack use has ended.
 
 - Real disks may tear a write in a non-prefix pattern (for example sector
   reordering). A complete final frame with a bad CRC is now `ErrCorruption`;
-  recovery requires explicit Repair. The MemFS crash model only keeps prefixes.
-- Tuple retention (dropping old summaries) is not implemented; merges keep all tuples.
+  recovery uses explicit Repair or opt-in AutoRepair. The MemFS crash model
+  only keeps prefixes.
+- Retired stub metadata and key ranges are retained to preserve I10; payloads
+  and archives can now be retired by policy.
 - `Picker` round-robin cursors are guarded by a mutex shared with manual
   `CompactLevel` callers.

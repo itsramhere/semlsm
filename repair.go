@@ -41,6 +41,12 @@ func Repair(dir string, opts Options) (report RepairReport, err error) {
 		return report, fmt.Errorf("semlsm: lock %s: %w", dir, err)
 	}
 	defer func() { err = errors.Join(err, lock.Unlock()) }()
+	return repairLocked(dir, opts)
+}
+
+// repairLocked is shared by Repair and AutoRepair; the caller owns LOCK and
+// has closed recovery readers/writers. opts already has defaults applied.
+func repairLocked(dir string, opts Options) (report RepairReport, err error) {
 	if err := checkOptionsFile(opts, dir); err != nil {
 		return report, err
 	}
@@ -197,4 +203,13 @@ func Repair(dir string, opts Options) (report RepairReport, err error) {
 		report.TruncatedFiles = append(report.TruncatedFiles, TruncatedFile{tr.name, st.Size - tr.valid})
 	}
 	return report, nil
+}
+
+// RecoveryReport returns the automatic repair performed during this Open.
+// The returned slices are independent copies. Manual Repair is not included.
+func (db *DB) RecoveryReport() (RepairReport, bool) {
+	r := db.recoveryReport
+	r.TruncatedFiles = append([]TruncatedFile(nil), r.TruncatedFiles...)
+	r.QuarantinedFiles = append([]string(nil), r.QuarantinedFiles...)
+	return r, db.repairsOnOpen != 0
 }

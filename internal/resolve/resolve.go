@@ -24,6 +24,7 @@ type Entry struct {
 	MaxTs    uint64
 	Count    uint64
 	LastKind base.Kind
+	Retired  bool
 }
 
 // Outcome is the resolution result.
@@ -38,6 +39,8 @@ const (
 	UseSummary
 	// Invariant: I7 is broken; the caller must return ErrCorruption.
 	Invariant
+	// UseExpired: a retired tuple covers the read; never expose older raw data.
+	UseExpired
 )
 
 // Resolve applies the B6 truth table.
@@ -85,6 +88,9 @@ func resolveEntryOnly(s uint64, r Raw, e Entry) Outcome {
 		return NotFound
 	}
 	// Row 8
+	if e.Retired {
+		return UseExpired
+	}
 	return UseSummary
 }
 

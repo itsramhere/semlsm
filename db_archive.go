@@ -6,7 +6,6 @@ import (
 
 	"semlsm/internal/archive"
 	"semlsm/internal/base"
-	"semlsm/internal/checkpoint"
 	"semlsm/internal/resolve"
 )
 
@@ -55,6 +54,7 @@ func (db *DB) getArchivedAtState(key []byte, ts, visible uint64, rs *readState) 
 	group := string(base.GroupOf(key, db.opts.GroupDepth, db.opts.GroupDelimiter))
 	var best resolve.Entry
 	var bestNum uint64 // the covering tuple's archive segment (0 = none)
+	var retired bool
 	for _, loc := range rs.version.Ckpts.GroupRefs(group) {
 		ref := loc.Ref
 		if ref.TsFrom > ts {
@@ -74,12 +74,18 @@ func (db *DB) getArchivedAtState(key []byte, ts, visible uint64, rs *readState) 
 			continue
 		}
 		if !best.Found || ke.MinTs >= best.MinTs {
+			meta, err := r.ReadMeta(ref.ID)
+			if err != nil {
+				rel()
+				return Result{}, err
+			}
 			best = resolve.Entry{Found: true, MinTs: ke.MinTs, MaxTs: ke.MaxTs, Count: ke.Count, LastKind: ke.LastKind}
-			bestNum = tupleArchiveNum(r, ref.ID)
+			bestNum = meta.ArchiveFileNum
+			retired = meta.RetiredUnixNano != 0 || meta.ArchiveRetiredUnixNano != 0
 		}
 		rel()
 	}
-	if !best.Found || bestNum == 0 {
+	if !best.Found {
 		return Result{}, fmt.Errorf("%w: no covering archived segment for %q at %d", base.ErrNotArchived, key, ts)
 	}
 	// Past the run the archive is not authoritative: the true value at ts
@@ -91,6 +97,12 @@ func (db *DB) getArchivedAtState(key []byte, ts, visible uint64, rs *readState) 
 			return Result{}, ErrFutureTimestamp
 		}
 		return db.getAtState(key, ts, rs)
+	}
+	if retired {
+		return Result{}, fmt.Errorf("%w: %q at %d", ErrArchiveRetired, key, ts)
+	}
+	if bestNum == 0 {
+		return Result{}, fmt.Errorf("%w: no archived segment for %q at %d", ErrNotArchived, key, ts)
 	}
 
 	r, err := archive.Open(db.opts.FS, archive.Path(db.archiveDir(), bestNum))
@@ -116,13 +128,4 @@ func (db *DB) getArchivedAtState(key []byte, ts, visible uint64, rs *readState) 
 		Value:     copyBytes(rec.Value),
 		VersionTs: rec.Ts,
 	}, nil
-}
-
-// tupleArchiveNum reads one tuple's ArchiveFileNum from its meta.
-func tupleArchiveNum(r *checkpoint.Reader, id uint64) uint64 {
-	meta, err := r.ReadMeta(id)
-	if err != nil {
-		return 0
-	}
-	return meta.ArchiveFileNum
 }

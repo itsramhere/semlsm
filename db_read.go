@@ -33,7 +33,7 @@ type Result struct {
 	Key        []byte
 	Value      []byte          // set only for ResultExact
 	VersionTs  uint64          // Exact: the version's ts; Summarized: 0
-	Checkpoint *CheckpointInfo // set only for ResultSummarized
+	Checkpoint *CheckpointInfo // set for ResultSummarized or ResultExpired
 }
 
 // ResultKind classifies a read result (B5).
@@ -46,21 +46,25 @@ const (
 	ResultExact
 	// ResultSummarized: covered by a checkpoint tuple.
 	ResultSummarized
+	// ResultExpired: the covering summary was retired; its range still masks raw history.
+	ResultExpired
 )
 
 // CheckpointInfo describes the tuple covering a summarized read (B5).
 type CheckpointInfo struct {
-	ID               uint64
-	Group            string
-	TsFrom, TsTo     uint64
-	SourceCount      uint64
-	SourceBytes      uint64
-	SourceCRC32      uint32
-	KeyMinTs         uint64
-	KeyMaxTs         uint64
-	KeyCount         uint64
-	Summary          Summary
-	ArchiveAvailable bool
+	ID                     uint64
+	Group                  string
+	TsFrom, TsTo           uint64
+	SourceCount            uint64
+	SourceBytes            uint64
+	SourceCRC32            uint32
+	KeyMinTs               uint64
+	KeyMaxTs               uint64
+	KeyCount               uint64
+	Summary                Summary
+	ArchiveAvailable       bool
+	RetiredUnixNano        int64
+	ArchiveRetiredUnixNano int64
 }
 
 // Get returns the latest visible version of key.
@@ -122,13 +126,17 @@ func (db *DB) getAtState(key []byte, s uint64, rs *readState) (Result, error) {
 			Value:     copyBytes(value),
 			VersionTs: raw.Ts,
 		}, nil
-	case resolve.UseSummary:
+	case resolve.UseSummary, resolve.UseExpired:
 		info, err := db.checkpointInfoFor(key, entry, hit)
 		if err != nil {
 			return Result{}, err
 		}
+		kind := ResultSummarized
+		if outcome == resolve.UseExpired {
+			kind = ResultExpired
+		}
 		return Result{
-			Kind:       ResultSummarized,
+			Kind:       kind,
 			Key:        copyBytes(key),
 			Checkpoint: info,
 		}, nil
@@ -257,6 +265,14 @@ func (db *DB) checkpointLookup(key []byte, s uint64, rs *readState) (resolve.Ent
 			rel()
 			continue
 		}
+		meta, merr := r.ReadMeta(ref.ID)
+		if merr != nil {
+			rel()
+			if hit != nil {
+				hit.rel()
+			}
+			return resolve.Entry{}, nil, merr
+		}
 		// B6: only entries with MinTs <= S are eligible; keep the one with
 		// the largest MinTs.
 		if ke.MinTs <= s && (!best.Found || ke.MinTs >= best.MinTs) {
@@ -269,6 +285,7 @@ func (db *DB) checkpointLookup(key []byte, s uint64, rs *readState) (resolve.Ent
 				MaxTs:    ke.MaxTs,
 				Count:    ke.Count,
 				LastKind: ke.LastKind,
+				Retired:  meta.RetiredUnixNano != 0,
 			}
 			hit = &ckptHit{ref: ref, reader: r, rel: rel}
 			continue
@@ -306,20 +323,24 @@ func buildCheckpointInfo(r *checkpoint.Reader, ref manifest.TupleRef, entry reso
 		return nil, err
 	}
 	info := &CheckpointInfo{
-		ID:               meta.ID,
-		Group:            meta.Group,
-		TsFrom:           meta.TsFrom,
-		TsTo:             meta.TsTo,
-		SourceCount:      meta.SourceCount,
-		SourceBytes:      meta.SourceBytes,
-		SourceCRC32:      meta.SourceCRC32,
-		KeyMinTs:         entry.MinTs,
-		KeyMaxTs:         entry.MaxTs,
-		KeyCount:         entry.Count,
-		ArchiveAvailable: meta.ArchiveFileNum != 0,
+		ID:                     meta.ID,
+		Group:                  meta.Group,
+		TsFrom:                 meta.TsFrom,
+		TsTo:                   meta.TsTo,
+		SourceCount:            meta.SourceCount,
+		SourceBytes:            meta.SourceBytes,
+		SourceCRC32:            meta.SourceCRC32,
+		KeyMinTs:               entry.MinTs,
+		KeyMaxTs:               entry.MaxTs,
+		KeyCount:               entry.Count,
+		ArchiveAvailable:       meta.ArchiveFileNum != 0,
+		RetiredUnixNano:        meta.RetiredUnixNano,
+		ArchiveRetiredUnixNano: meta.ArchiveRetiredUnixNano,
 	}
-	if sumJSON, err := r.ReadSummary(ref.ID); err == nil && len(sumJSON) > 0 {
-		_ = json.Unmarshal(sumJSON, &info.Summary)
+	if meta.RetiredUnixNano == 0 {
+		if sumJSON, err := r.ReadSummary(ref.ID); err == nil && len(sumJSON) > 0 {
+			_ = json.Unmarshal(sumJSON, &info.Summary)
+		}
 	}
 	return info, nil
 }

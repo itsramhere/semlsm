@@ -91,6 +91,9 @@ func hardeningCrashAt(t *testing.T, fp string, mode vfs.CrashMode, rng *rand.Ran
 	clk := base.NewManualClock(semStart)
 	stack := newSemStack(t, fs, "db", llm.NewMock(llm.MockValid), 0)
 	o := semOptions(fs, clk, stack)
+	if strings.HasPrefix(fp, "retention.") {
+		o.SummaryRetention = time.Hour
+	}
 	o.ArchiveRaw = true
 	db, err := Open("db", o)
 	if err != nil {
@@ -113,6 +116,15 @@ func hardeningCrashAt(t *testing.T, fp string, mode vfs.CrashMode, rng *rand.Ran
 
 	// Arm the failpoint and trigger the operation that reaches it.
 	sentinel := errors.New("crash at " + fp)
+	if strings.HasPrefix(fp, "retention.") {
+		if err := db.CompactLevel(ctx, base.NumLevels-1); err != nil {
+			t.Fatal(err)
+		}
+		if checkpointCount(db) == 0 {
+			t.Fatal("retention failpoint needs a checkpoint")
+		}
+		hardeningCommit(t, db, model, "app/1/e", 60)
+	}
 	if strings.HasPrefix(fp, "ckptmerge.") {
 		// Build two real semantic checkpoints before arming the merge hook.
 		for i := 40; i < 60; i++ {
@@ -133,6 +145,8 @@ func hardeningCrashAt(t *testing.T, fp string, mode vfs.CrashMode, rng *rand.Ran
 	}
 	failpoint.SetError(fp, sentinel)
 	switch {
+	case strings.HasPrefix(fp, "retention."):
+		_ = db.ApplyRetention(ctx)
 	case strings.HasPrefix(fp, "ckptmerge."):
 		_ = db.CompactCheckpoints(ctx)
 	case strings.HasPrefix(fp, "flush."):

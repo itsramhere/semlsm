@@ -24,7 +24,14 @@ func (db *DB) CompactCheckpoints(ctx context.Context) error {
 	return err
 }
 
-func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged bool, err error) {
+func (db *DB) compactCheckpoints(ctx context.Context, background bool) (bool, error) {
+	return db.rewriteCheckpoints(ctx, background, false)
+}
+
+// rewriteCheckpoints shares admission, busy reservations, publication, rollback,
+// and version-death cleanup between merging and retention.
+func (db *DB) rewriteCheckpoints(ctx context.Context, background, retention bool) (merged bool, err error) {
+	now := db.opts.Clock.Now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return false, err
@@ -46,12 +53,23 @@ func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged b
 		case <-ctx.Done():
 			return false, ctx.Err()
 		case <-done:
+			now = db.opts.Clock.Now()
 		}
 	}
 	// mu is held. A version reference protects every input through I/O and
 	// installation. Busy reservations prevent overlapping file jobs.
 	v := db.rs.version
-	if background && (db.opts.CkptMergeThreshold < 0 || len(v.Ckpts.ByNum) <= db.opts.CkptMergeThreshold) {
+	if retention {
+		if db.opts.ArchiveRetention == 0 && db.opts.SummaryRetention == 0 {
+			db.mu.Unlock()
+			return false, nil
+		}
+		if background && !db.lastRetention.IsZero() && now.Sub(db.lastRetention) < db.opts.RetentionInterval {
+			db.mu.Unlock()
+			return false, nil
+		}
+		db.lastRetention = now
+	} else if background && (db.opts.CkptMergeThreshold < 0 || len(v.Ckpts.ByNum) <= db.opts.CkptMergeThreshold) {
 		db.mu.Unlock()
 		return false, nil
 	}
@@ -63,13 +81,14 @@ func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged b
 	}
 	sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
 	k := max(2, db.opts.CkptMergeThreshold)
-	if len(nums) > k {
+	if !retention && len(nums) > k {
 		nums = nums[:k]
 	}
-	if len(nums) < 2 {
+	if len(nums) == 0 || (!retention && len(nums) < 2) {
 		db.mu.Unlock()
 		return false, nil
 	}
+	reserved := append([]uint64(nil), nums...)
 	v.Ref()
 	for _, num := range nums {
 		db.busy[num] = true
@@ -83,7 +102,7 @@ func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged b
 	defer func() {
 		v.Unref()
 		db.mu.Lock()
-		for _, num := range nums {
+		for _, num := range reserved {
 			delete(db.busy, num)
 		}
 		delete(db.busy, outputNum)
@@ -95,6 +114,53 @@ func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged b
 		db.drainObsolete()
 		db.ckptMergeWG.Done()
 	}()
+	if retention {
+		var affected []uint64
+		for _, num := range nums {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			if db.closed.Load() {
+				return false, ErrClosed
+			}
+			cf := v.Ckpts.ByNum[num]
+			if !db.retentionCandidate(cf, now) {
+				continue
+			}
+			r, err := checkpoint.OpenReader(db.opts.FS, filepath.Join(db.dir, ckptName(num)))
+			if err != nil {
+				return false, err
+			}
+			changed := false
+			for _, ref := range cf.Tuples {
+				if err := ctx.Err(); err != nil {
+					r.Close()
+					return false, err
+				}
+				if db.closed.Load() {
+					r.Close()
+					return false, ErrClosed
+				}
+				meta, err := r.ReadMeta(ref.ID)
+				if err != nil {
+					r.Close()
+					return false, err
+				}
+				if _, due := db.retainedMeta(meta, now); due {
+					changed = true
+					break
+				}
+			}
+			r.Close()
+			if changed {
+				affected = append(affected, num)
+			}
+		}
+		nums = affected
+		if len(nums) == 0 {
+			return false, nil
+		}
+	}
 	outputNum = db.allocFile()
 	db.mu.Lock()
 	db.busy[outputNum] = true
@@ -138,7 +204,23 @@ func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged b
 					return fmt.Errorf("semlsm: checkpoint merge duplicate tuple %d: %w", ref.ID, ErrCorruption)
 				}
 				ids[ref.ID] = true
-				meta, loc, err := w.CopyTuple(r, ref.ID)
+				var meta checkpoint.TupleMeta
+				var loc checkpoint.DirEntry
+				var err error
+				if retention {
+					meta, err = r.ReadMeta(ref.ID)
+					if err != nil {
+						return err
+					}
+					if changed, due := db.retainedMeta(meta, now); due {
+						meta = changed
+						loc, err = w.RewriteTuple(r, ref.ID, meta, meta.RetiredUnixNano != 0)
+					} else {
+						meta, loc, err = w.CopyTuple(r, ref.ID)
+					}
+				} else {
+					meta, loc, err = w.CopyTuple(r, ref.ID)
+				}
 				if err != nil {
 					return err
 				}
@@ -152,8 +234,10 @@ func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged b
 				}
 			}
 			// Preserve the manifest union too, including known-empty sets.
-			for _, n := range input.ArchiveNums {
-				archives[n] = true
+			if !retention {
+				for _, n := range input.ArchiveNums {
+					archives[n] = true
+				}
 			}
 			return nil
 		}()
@@ -177,7 +261,11 @@ func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged b
 	if err := db.opts.FS.SyncDir(db.dir); err != nil {
 		return false, err
 	}
-	if err := failpoint.Hit(fpCkptMergeAfterWrite); err != nil {
+	afterWrite, afterManifest := fpCkptMergeAfterWrite, fpCkptMergeAfterManifest
+	if retention {
+		afterWrite, afterManifest = fpRetentionAfterWrite, fpRetentionAfterManifest
+	}
+	if err := failpoint.Hit(afterWrite); err != nil {
 		return false, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -225,12 +313,16 @@ func (db *DB) compactCheckpoints(ctx context.Context, background bool) (merged b
 	db.rs = &readState{mem: old.mem, imms: old.imms, version: cur}
 	old.release()
 	db.mu.Unlock()
-	db.ckptMerges.Add(1)
-	db.ckptFilesMerged.Add(uint64(len(nums)))
+	if retention {
+		db.retentionPasses.Add(1)
+	} else {
+		db.ckptMerges.Add(1)
+		db.ckptFilesMerged.Add(uint64(len(nums)))
+	}
 	if appendErr != nil {
 		return true, appendErr
 	}
-	if err := failpoint.Hit(fpCkptMergeAfterManifest); err != nil {
+	if err := failpoint.Hit(afterManifest); err != nil {
 		return true, err
 	}
 	return true, nil

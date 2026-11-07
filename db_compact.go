@@ -70,6 +70,17 @@ func (db *DB) fastCompactLoop() {
 			return
 		}
 		db.drainObsolete()
+		retained, retentionErr := db.rewriteCheckpoints(context.Background(), true, true)
+		if retentionErr != nil {
+			if db.closed.Load() {
+				return
+			}
+			db.compactErrs.Add(1)
+			db.logger.Warn("semlsm: retention failed", "err", retentionErr)
+			if !db.compactBackoff(&backoff) {
+				return
+			}
+		}
 		// One bounded checkpoint job per iteration, alongside (not in place
 		// of) fast SST work. Tier B workers never wait for this copy's I/O.
 		merged, mergeErr := db.compactCheckpoints(context.Background(), true)
@@ -90,7 +101,7 @@ func (db *DB) fastCompactLoop() {
 		db.maybePreemptDeep()
 		plan := db.pickFast()
 		if plan == nil {
-			if merged {
+			if merged || retained {
 				continue
 			}
 			select {
@@ -461,11 +472,13 @@ func (db *DB) enqueueDyingArchives(cf *manifest.CkptFile) {
 // VerifyReport summarizes an integrity check (P7.5 minimal form; P11.3
 // extends it with archive CRC and tuple-chain validation).
 type VerifyReport struct {
-	SSTFiles  int
-	CkptFiles int
-	Tuples    int
-	Entries   int
-	Problems  []string
+	Stubs                int
+	ArchiveRetiredTuples int
+	SSTFiles             int
+	CkptFiles            int
+	Tuples               int
+	Entries              int
+	Problems             []string
 }
 
 // tupleRun is one key's dropped range within a tuple (I7 checking).
@@ -540,8 +553,19 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (VerifyReport, error) {
 			rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d: open: %v", num, err))
 			continue
 		}
-		for _, t := range r.Tuples() {
+		for _, ref := range v.Ckpts.ByNum[num].Tuples {
+			t, err := r.ReadMeta(ref.ID)
+			if err != nil {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d tuple %d: meta: %v", num, ref.ID, err))
+				continue
+			}
 			rep.Tuples++
+			if t.RetiredUnixNano != 0 {
+				rep.Stubs++
+			}
+			if t.ArchiveRetiredUnixNano != 0 {
+				rep.ArchiveRetiredTuples++
+			}
 			chains[t.Group] = append(chains[t.Group], t)
 			keys, err := r.IterKeys(t.ID)
 			if err != nil {
@@ -553,10 +577,14 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (VerifyReport, error) {
 				tupleRuns[string(ke.Key)] = append(tupleRuns[string(ke.Key)],
 					tupleRun{min: ke.MinTs, max: ke.MaxTs, tuple: t.ID})
 			}
-			if _, err := r.ReadSummary(t.ID); err != nil {
-				rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d tuple %d: summary: %v", num, t.ID, err))
+			if t.RetiredUnixNano == 0 {
+				if _, err := r.ReadSummary(t.ID); err != nil {
+					rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d tuple %d: summary: %v", num, t.ID, err))
+				}
+				if t.ArchiveRetiredUnixNano == 0 {
+					db.verifyArchiveCrc(&rep, t)
+				}
 			}
-			db.verifyArchiveCrc(&rep, t)
 		}
 		rel()
 		rep.CkptFiles++

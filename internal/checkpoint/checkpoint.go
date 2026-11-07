@@ -30,26 +30,28 @@ var (
 
 // TupleMeta is the per-tuple metadata (B8).
 type TupleMeta struct {
-	ID              uint64 `json:"id"`
-	Group           string `json:"group"`
-	TsFrom          uint64 `json:"ts_from"`
-	TsTo            uint64 `json:"ts_to"`
-	SourceCount     uint64 `json:"source_count"`
-	SourceBytes     uint64 `json:"source_bytes"`
-	SourceCRC32     uint32 `json:"source_crc32"`
-	PutCount        uint64 `json:"put_count"`
-	DeleteCount     uint64 `json:"delete_count"`
-	KeyCount        uint64 `json:"key_count"`
-	FromLevel       int    `json:"from_level"`
-	ToLevel         int    `json:"to_level"`
-	Model           string `json:"model"`
-	PromptVersion   int    `json:"prompt_version"`
-	CreatedUnixNano int64  `json:"created_unix_nano"`
-	PrevTupleID     uint64 `json:"prev_tuple_id"`
-	ArchiveFileNum  uint64 `json:"archive_file_num"`
-	InputTokens     uint64 `json:"input_tokens"`
-	OutputTokens    uint64 `json:"output_tokens"`
-	Degraded        bool   `json:"degraded"`
+	ID                     uint64 `json:"id"`
+	Group                  string `json:"group"`
+	TsFrom                 uint64 `json:"ts_from"`
+	TsTo                   uint64 `json:"ts_to"`
+	SourceCount            uint64 `json:"source_count"`
+	SourceBytes            uint64 `json:"source_bytes"`
+	SourceCRC32            uint32 `json:"source_crc32"`
+	PutCount               uint64 `json:"put_count"`
+	DeleteCount            uint64 `json:"delete_count"`
+	KeyCount               uint64 `json:"key_count"`
+	FromLevel              int    `json:"from_level"`
+	ToLevel                int    `json:"to_level"`
+	Model                  string `json:"model"`
+	PromptVersion          int    `json:"prompt_version"`
+	CreatedUnixNano        int64  `json:"created_unix_nano"`
+	PrevTupleID            uint64 `json:"prev_tuple_id"`
+	ArchiveFileNum         uint64 `json:"archive_file_num"`
+	RetiredUnixNano        int64  `json:"retired_unix_nano,omitempty"`
+	ArchiveRetiredUnixNano int64  `json:"archive_retired_unix_nano,omitempty"`
+	InputTokens            uint64 `json:"input_tokens"`
+	OutputTokens           uint64 `json:"output_tokens"`
+	Degraded               bool   `json:"degraded"`
 }
 
 // KeyEntry is one key's run within a tuple's key index.
@@ -135,7 +137,8 @@ func (w *Writer) AddTuple(meta TupleMeta, summaryJSON []byte, entries []KeyEntry
 	return nil
 }
 
-// CopyTuple freshly reads and verifies every section of id, then appends the
+// CopyTuple freshly verifies metadata and index (also the summary for live
+// tuples), then appends the
 // original bytes without re-encoding metadata, summary, or key index. Only the
 // returned directory offset changes. It does not populate the reader cache.
 func (w *Writer) CopyTuple(r *Reader, id uint64) (TupleMeta, DirEntry, error) {
@@ -153,16 +156,65 @@ func (w *Writer) CopyTuple(r *Reader, id uint64) (TupleMeta, DirEntry, error) {
 	if _, err := iterIndex(t.index); err != nil {
 		return TupleMeta{}, DirEntry{}, err
 	}
+	d, err := w.appendCopiedTuple(id, raw)
+	return t.meta, d, err
+}
+
+// RewriteTuple changes metadata and optionally removes the summary, preserving
+// the original encoded key index and (when kept) summary bytes. Read CRCs are
+// verified afresh. Callers keep identity/range fields unchanged for retention.
+func (w *Writer) RewriteTuple(r *Reader, id uint64, meta TupleMeta, dropSummary bool) (DirEntry, error) {
+	if w.finished {
+		return DirEntry{}, fmt.Errorf("ckpt: rewrite after finish %s", w.path)
+	}
+	if meta.ID != id {
+		return DirEntry{}, fmt.Errorf("ckpt: rewrite changes tuple identity: %w", base.ErrCorruption)
+	}
+	raw, err := r.tupleBytes(id)
+	if err != nil {
+		return DirEntry{}, err
+	}
+	t, err := parseTuple(id, raw)
+	if err != nil {
+		return DirEntry{}, err
+	}
+	if _, err := iterIndex(t.index); err != nil {
+		return DirEntry{}, err
+	}
+	metaEnd := 4 + int(binary.LittleEndian.Uint32(raw)) + 4
+	sumEnd := metaEnd + 4 + int(binary.LittleEndian.Uint32(raw[metaEnd:]))
+	summary := raw[metaEnd:sumEnd]
+	if dropSummary {
+		section, err := encodeSection(nil)
+		if err != nil {
+			return DirEntry{}, err
+		}
+		summary = binary.LittleEndian.AppendUint32(nil, uint32(len(section)))
+		summary = append(summary, section...)
+	}
+	payload, err := json.Marshal(meta)
+	if err != nil {
+		return DirEntry{}, err
+	}
+	buf := binary.LittleEndian.AppendUint32(nil, uint32(len(payload)))
+	buf = append(buf, payload...)
+	buf = binary.LittleEndian.AppendUint32(buf, base.CRC(payload))
+	buf = append(buf, summary...)
+	buf = append(buf, raw[sumEnd:]...)
+	return w.appendCopiedTuple(id, buf)
+}
+
+func (w *Writer) appendCopiedTuple(id uint64, raw []byte) (DirEntry, error) {
 	d := DirEntry{ID: id, Offset: uint64(w.offset), Length: uint64(len(raw))}
 	if n, err := w.f.Write(raw); err != nil {
-		return TupleMeta{}, DirEntry{}, fmt.Errorf("ckpt: copy tuple %d: %w", id, err)
+		return DirEntry{}, fmt.Errorf("ckpt: copy tuple %d: %w", id, err)
 	} else if n != len(raw) {
-		return TupleMeta{}, DirEntry{}, io.ErrShortWrite
+		return DirEntry{}, io.ErrShortWrite
 	}
 	w.offset += int64(len(raw))
 	w.dir = append(w.dir, d)
 	w.tuples++
-	return t.meta, d, nil
+	return d, nil
 }
 
 // Finish writes the directory and footer, syncs, and closes.

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"semlsm/internal/base"
 	"semlsm/internal/bloom"
@@ -12,6 +13,7 @@ import (
 
 // Reader reads one open .ckpt file. Parsed tuples are cached lazily.
 type Reader struct {
+	mu   sync.Mutex // protects the lazy tuple cache across concurrent readers
 	f    vfs.File
 	path string
 	dir  []DirEntry
@@ -142,6 +144,8 @@ func (r *Reader) tupleBytes(id uint64) ([]byte, error) {
 
 // loadTuple parses and caches one tuple.
 func (r *Reader) loadTuple(id uint64) (*parsedTuple, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if t, ok := r.tup[id]; ok {
 		return t, nil
 	}
@@ -156,7 +160,8 @@ func (r *Reader) loadTuple(id uint64) (*parsedTuple, error) {
 	return t, err
 }
 
-// parseTuple verifies the CRC and structure of every section.
+// parseTuple verifies metadata and index CRCs and structure. Only retired
+// stubs may skip the unavailable summary section.
 func parseTuple(id uint64, buf []byte) (*parsedTuple, error) {
 	t := &parsedTuple{}
 	pos := 0
@@ -192,9 +197,11 @@ func parseTuple(id uint64, buf []byte) (*parsedTuple, error) {
 	if pos+int(sumLen) > len(buf) {
 		return nil, fmt.Errorf("ckpt: tuple %d summary truncated: %w", id, base.ErrCorruption)
 	}
-	t.summary, err = decodeSection(buf[pos : pos+int(sumLen)])
-	if err != nil {
-		return nil, err
+	if t.meta.RetiredUnixNano == 0 {
+		t.summary, err = decodeSection(buf[pos : pos+int(sumLen)])
+		if err != nil {
+			return nil, err
+		}
 	}
 	pos += int(sumLen)
 
