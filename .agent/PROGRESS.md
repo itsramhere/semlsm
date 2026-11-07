@@ -191,7 +191,7 @@ fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
 - [x] Gate 7 (P7) — PASSED, commit 499daf4, tag phase-7-done
 - [x] Gate 8 (P8) — PASSED, commit d76b556 (fix(P8) race on Usage), tag phase-8-done, verdict M-022: approved on GATE EVIDENCE ONLY (no line-by-line review of internal/semantic). P8.2-P8.6 landed before the G-025 verdict (A10 continuation); disclosed in G-026. Run ended by M-023 STOP: P9-P15 not started.
 - [x] Gate 9 (P9) — PASSED: 82b77ca, fix(P9) 28a0659 (M-025 CHANGES: breaker trial wedge, Cancel, limiter fail-fast + Open-time TokensPerMinute check, persist-failure keeps response), tag phase-9-done re-pointed to 28a0659, verdict M-026 APPROVED
-- [ ] Gate 10 (P10) — tag phase-10-done on 90b8200; verdict M-027 CHANGES -> fix(P10) re-run gated, GATE G-034
+- [x] Gate 10 (P10) — PASSED: 90b8200, fix(P10) 7b024e1 (M-027 CHANGES: failed-job file cleanup, archive orphan sweep at Open, supervisor tests ported), tag phase-10-done re-pointed to 7b024e1, verdict M-028 APPROVED
 - [ ] Gate 11 (P11) — tagged phase-11-done
 - [ ] Gate 12 (P12) — tagged phase-12-done
 - [ ] Gate 13 (P13) — tagged phase-13-done
