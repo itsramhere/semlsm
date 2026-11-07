@@ -4,6 +4,7 @@ package compaction
 
 import (
 	"path/filepath"
+	"sync"
 
 	"semlsm/internal/base"
 	"semlsm/internal/manifest"
@@ -20,6 +21,11 @@ type Picker struct {
 	TargetFileBytes  int64
 	cursors          [base.NumLevels]uint64 // round-robin per input level
 	fastParity       bool                   // alternates L0/L1 when both are over target
+
+	// mu guards the cursors and fastParity: PickFast runs on the fast
+	// worker while PickLevel runs on manual CompactLevel callers
+	// (M-032 note 3).
+	mu sync.Mutex
 }
 
 // NewPicker builds a picker.
@@ -73,6 +79,8 @@ func (pl *Plan) AllFiles() []*version.FileMeta {
 // gets rewritten forever and L2 never sees data — found by the P13
 // hardening work).
 func (p *Picker) PickFast(v *version.Version, busy map[uint64]bool) *Plan {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	scores := p.Score(v)
 	l0 := scores[0] >= 1
 	l1 := scores[1] >= 1
@@ -105,6 +113,8 @@ func (p *Picker) PickFast(v *version.Version, busy map[uint64]bool) *Plan {
 // PickDeep returns a plan for L2->L3 or L3->L4 when either scores >= 1,
 // or nil.
 func (p *Picker) PickDeep(v *version.Version, busy map[uint64]bool) *Plan {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	scores := p.Score(v)
 	if scores[2] >= 1 {
 		if pl := p.planLevel(v, 2, busy); pl != nil {
@@ -122,6 +132,8 @@ func (p *Picker) PickDeep(v *version.Version, busy map[uint64]bool) *Plan {
 // PickLevel builds a plan for an explicit level (CompactLevel). The bottom
 // level has no deeper level; callers handle self-compaction.
 func (p *Picker) PickLevel(v *version.Version, level int, busy map[uint64]bool) *Plan {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if level < 0 || level >= base.NumLevels-1 {
 		return nil
 	}

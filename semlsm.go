@@ -762,10 +762,6 @@ func (db *DB) Close() error {
 		if db.manifest != nil {
 			_ = db.manifest.Close()
 		}
-		// stop obsolete deleter
-		if db.obsolete != nil {
-			db.obsolete.Stop()
-		}
 		// close cached readers
 		if db.tableCache != nil {
 			db.tableCache.CloseAll()
@@ -773,13 +769,19 @@ func (db *DB) Close() error {
 		if db.ckptCache != nil {
 			db.ckptCache.CloseAll()
 		}
-		// release read state
+		// release the read state, then give the deleter the files that
+		// freeing it makes obsolete, and only then stop the deleter
+		// (M-032 note 2: files freed by the last release reach the disk).
 		db.mu.Lock()
 		if db.rs != nil {
 			db.rs.release()
 			db.rs = nil
 		}
 		db.mu.Unlock()
+		db.drainObsolete()
+		if db.obsolete != nil {
+			db.obsolete.Stop()
+		}
 
 		if err := db.lockH.Unlock(); err != nil && firstErr == nil {
 			firstErr = err
