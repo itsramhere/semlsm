@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/failpoint"
-	"semlsm/internal/llm"
-	"semlsm/internal/semantic"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/failpoint"
+	"github.com/itsramhere/semlsm/internal/llm"
+	"github.com/itsramhere/semlsm/internal/semantic"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // semStart is the ManualClock origin for semantic tests.

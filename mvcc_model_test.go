@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/llm"
-	"semlsm/internal/resolve"
-	"semlsm/internal/testmodel"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/llm"
+	"github.com/itsramhere/semlsm/internal/resolve"
+	"github.com/itsramhere/semlsm/internal/testmodel"
 )
 
 // TestHistoryInterleaving is the P11.2 test: raw versions and tuple runs

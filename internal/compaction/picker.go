@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"sync"
 
-	"semlsm/internal/base"
-	"semlsm/internal/manifest"
-	"semlsm/internal/sstable"
-	"semlsm/internal/version"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/sstable"
+	"github.com/itsramhere/semlsm/internal/version"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // Picker computes level scores and compaction plans (P6.1).

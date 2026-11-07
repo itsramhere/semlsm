@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // PromptVersion is the prompt schema version (P8.4). Bump when the prompt

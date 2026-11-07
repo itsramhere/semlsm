@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"semlsm/internal/base"
-	"semlsm/internal/testutil"
-	"semlsm/internal/vfs"
-	"semlsm/internal/wal"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/wal"
 )
 
 func TestCheckpointArchiveNumsPresence(t *testing.T) {

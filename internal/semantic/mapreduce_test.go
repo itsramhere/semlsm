@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/llm"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/llm"
 )
 
 func segOf(n int) Segment {

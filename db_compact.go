@@ -7,17 +7,17 @@ import (
 	"sort"
 	"time"
 
-	"semlsm/internal/archive"
-	"semlsm/internal/base"
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/compaction"
-	"semlsm/internal/failpoint"
-	"semlsm/internal/manifest"
-	"semlsm/internal/memtable"
-	"semlsm/internal/merge"
-	"semlsm/internal/semantic"
-	"semlsm/internal/sstable"
-	"semlsm/internal/version"
+	"github.com/itsramhere/semlsm/internal/archive"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/compaction"
+	"github.com/itsramhere/semlsm/internal/failpoint"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/memtable"
+	"github.com/itsramhere/semlsm/internal/merge"
+	"github.com/itsramhere/semlsm/internal/semantic"
+	"github.com/itsramhere/semlsm/internal/sstable"
+	"github.com/itsramhere/semlsm/internal/version"
 )
 
 // Failpoint names for structural compaction (P6.2).

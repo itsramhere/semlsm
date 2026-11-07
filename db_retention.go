@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/failpoint"
-	"semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/failpoint"
+	"github.com/itsramhere/semlsm/internal/manifest"
 )
 
 var (

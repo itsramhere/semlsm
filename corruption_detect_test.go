@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/llm"
-	"semlsm/internal/testmodel"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/llm"
+	"github.com/itsramhere/semlsm/internal/testmodel"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // TestCorruptionNeverSilent: every byte flip (at the matrix's sampled

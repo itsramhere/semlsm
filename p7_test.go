@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/manifest"
-	"semlsm/internal/sstable"
-	"semlsm/internal/testmodel"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/sstable"
+	"github.com/itsramhere/semlsm/internal/testmodel"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // installHandmadeCheckpoint rewrites the SSTs that hold dropped versions and

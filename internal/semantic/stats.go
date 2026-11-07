@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"sort"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // maxTopEntries caps the TopKeys and NumericFields lists (B9).

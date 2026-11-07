@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"semlsm/internal/base"
-	"semlsm/internal/vfs"
-	"semlsm/internal/wal"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/wal"
 )
 
 // RollThreshold is the manifest size at which the DB rolls to a new manifest.

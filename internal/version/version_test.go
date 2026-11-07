@@ -5,8 +5,8 @@ import (
 	"sync"
 	"testing"
 
-	"semlsm/internal/base"
-	"semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/manifest"
 )
 
 func fm(level int, num uint64, smallest, largest string) manifest.FileMeta {

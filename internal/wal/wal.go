@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"io"
 
-	"semlsm/internal/base"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // MaxPayloadSize is the largest batch payload a frame may carry (64 MiB).

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 type mEntry struct {

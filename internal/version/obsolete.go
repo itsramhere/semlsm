@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"semlsm/internal/sstable"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/sstable"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // ObsoleteFile is one file scheduled for deletion.

@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"sort"
 
-	"semlsm/internal/base"
-	"semlsm/internal/memtable"
-	"semlsm/internal/resolve"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/memtable"
+	"github.com/itsramhere/semlsm/internal/resolve"
 )
 
 // RawVersion is one raw version in a History listing (B5).

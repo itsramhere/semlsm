@@ -4,7 +4,7 @@ package testutil
 import (
 	"testing"
 
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // TrackMemFS registers a check after the caller's later cleanup callbacks.

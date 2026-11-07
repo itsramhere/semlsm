@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/failpoint"
-	"semlsm/internal/llm"
-	"semlsm/internal/manifest"
-	"semlsm/internal/testmodel"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/failpoint"
+	"github.com/itsramhere/semlsm/internal/llm"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/testmodel"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 type ckptProbe struct {

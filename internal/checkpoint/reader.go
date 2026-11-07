@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"sync"
 
-	"semlsm/internal/base"
-	"semlsm/internal/bloom"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/bloom"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // Reader reads one open .ckpt file. Parsed tuples are cached lazily.

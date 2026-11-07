@@ -1,8 +1,8 @@
 # SemLSM Architecture
 
-This document describes the code **as built** (through P14). The normative
-spec is `SEMLSM_IMPLEMENTATION_PLAN.md`; where implementation choices were
-made they are marked.
+This document describes the implemented storage engine, including checkpoint
+merging, retention, and explicit or opt-in repair. See [FORMATS.md](FORMATS.md)
+for the on-disk representations.
 
 ## 1. The tree
 

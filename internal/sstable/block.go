@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"io"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // restartInterval is the number of entries between restart points (B8: 16

@@ -7,7 +7,7 @@ import (
 	"sort"
 	"testing"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // sliceIter adapts a sorted slice of entries to the Iter interface.

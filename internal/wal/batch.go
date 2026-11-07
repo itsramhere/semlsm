@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // EncodeBatch encodes a batch payload per B8:

@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"semlsm/internal/base"
-	"semlsm/internal/failpoint"
-	"semlsm/internal/manifest"
-	"semlsm/internal/sstable"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/failpoint"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/sstable"
 	"time"
 
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // flushLoop drains immutable memtables into L0 SSTs (P5.4). On a persistent

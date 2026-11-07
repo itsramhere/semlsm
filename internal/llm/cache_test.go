@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/testutil"
 )
 
 func testCache(t *testing.T, maxBytes int64) (*Cache, *ManualClock) {

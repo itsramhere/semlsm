@@ -8,8 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"semlsm/internal/base"
-	"semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/manifest"
 )
 
 // FileMeta is a file in the tree. Instances are shared between Versions that

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // persistedUsage is the on-disk shape of llm/usage.json (P9.3).

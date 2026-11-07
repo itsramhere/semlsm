@@ -16,17 +16,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/compaction"
-	"semlsm/internal/failpoint"
-	"semlsm/internal/manifest"
-	"semlsm/internal/memtable"
-	"semlsm/internal/semantic"
-	"semlsm/internal/sstable"
-	"semlsm/internal/version"
-	"semlsm/internal/vfs"
-	"semlsm/internal/wal"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/compaction"
+	"github.com/itsramhere/semlsm/internal/failpoint"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/memtable"
+	"github.com/itsramhere/semlsm/internal/semantic"
+	"github.com/itsramhere/semlsm/internal/sstable"
+	"github.com/itsramhere/semlsm/internal/version"
+	"github.com/itsramhere/semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/wal"
 )
 
 // Re-exported sentinel errors (B5).

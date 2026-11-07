@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 
-	"semlsm/internal/manifest"
-	"semlsm/internal/version"
-	"semlsm/internal/wal"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/version"
+	"github.com/itsramhere/semlsm/internal/wal"
 )
 
 // TruncatedFile describes bytes explicitly discarded from a damaged log.

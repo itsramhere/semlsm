@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 var segClock = base.NewManualClock(time.Unix(1_000_000, 0))

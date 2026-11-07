@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/memtable"
-	"semlsm/internal/wal"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/memtable"
+	"github.com/itsramhere/semlsm/internal/wal"
 )
 
 // maxCommitGroup is the largest number of requests drained per group commit.

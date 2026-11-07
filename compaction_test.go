@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/failpoint"
-	"semlsm/internal/memtable"
-	"semlsm/internal/testmodel"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/failpoint"
+	"github.com/itsramhere/semlsm/internal/memtable"
+	"github.com/itsramhere/semlsm/internal/testmodel"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // compactOptions enables real compaction with small sizes.

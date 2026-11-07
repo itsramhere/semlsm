@@ -3,10 +3,10 @@ package semlsm
 import (
 	"path/filepath"
 
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/manifest"
-	"semlsm/internal/version"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/version"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // checkpointArchives uses manifest metadata whenever available. Legacy

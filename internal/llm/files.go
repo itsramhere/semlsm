@@ -5,7 +5,7 @@ import (
 	"io"
 	"path/filepath"
 
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // writeFileAtomic writes data to name through a temp file in the same

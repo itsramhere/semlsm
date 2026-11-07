@@ -9,9 +9,9 @@ import (
 	"sync"
 	"testing"
 
-	"semlsm/internal/base"
-	"semlsm/internal/testutil"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 type sstEntry struct {

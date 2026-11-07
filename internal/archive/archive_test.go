@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"semlsm/internal/base"
-	"semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/testutil"
 )
 
 func TestWriteVerifyAndLookup(t *testing.T) {

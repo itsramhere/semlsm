@@ -8,8 +8,8 @@ import (
 	"reflect"
 	"testing"
 
-	"semlsm/internal/base"
-	"semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/testutil"
 )
 
 func TestRewriteTupleRetentionPreservesSections(t *testing.T) {

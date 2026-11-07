@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 
-	"semlsm/internal/base"
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/manifest"
-	"semlsm/internal/resolve"
-	"semlsm/internal/version"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/resolve"
+	"github.com/itsramhere/semlsm/internal/version"
 )
 
 // acquireReadState returns the current read state with its version pinned,

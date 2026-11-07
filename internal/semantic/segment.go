@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // Segment is one batch of eligible records to summarize together into a

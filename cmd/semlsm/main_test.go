@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"semlsm/internal/base"
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/manifest"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 func TestCLIAutoRepairGolden(t *testing.T) {

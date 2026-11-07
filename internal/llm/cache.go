@@ -10,7 +10,7 @@ import (
 	"sort"
 	"sync"
 
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // cacheEntry is the on-disk JSON of one cached response under

@@ -9,7 +9,7 @@ import (
 	"sort"
 	"sync"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // Model records every committed (key, ts, kind, value) and dropped ranges.

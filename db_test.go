@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/base"
-	"semlsm/internal/manifest"
-	"semlsm/internal/testmodel"
-	"semlsm/internal/testutil"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/testmodel"
+	"github.com/itsramhere/semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // testOptions builds small-sized options for tests: MemFS, ManualClock-free

@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"semlsm/internal/archive"
-	"semlsm/internal/base"
-	"semlsm/internal/resolve"
+	"github.com/itsramhere/semlsm/internal/archive"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/resolve"
 )
 
 // archiveDir returns the archive root: Options.ArchiveDir when set, else

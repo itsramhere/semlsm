@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"semlsm/internal/base"
-	"semlsm/internal/llm"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/llm"
 )
 
 // ErrPoorCompression is returned when the summary is not small enough

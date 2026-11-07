@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 func TestPromptGoldenSystem(t *testing.T) {

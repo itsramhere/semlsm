@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 func TestComputeStatsBasics(t *testing.T) {

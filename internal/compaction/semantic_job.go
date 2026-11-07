@@ -10,17 +10,17 @@ import (
 	"sort"
 	"time"
 
-	"semlsm/internal/archive"
-	"semlsm/internal/base"
-	"semlsm/internal/checkpoint"
-	"semlsm/internal/failpoint"
-	"semlsm/internal/llm"
-	"semlsm/internal/manifest"
-	"semlsm/internal/merge"
-	"semlsm/internal/semantic"
-	"semlsm/internal/sstable"
-	"semlsm/internal/version"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/archive"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/checkpoint"
+	"github.com/itsramhere/semlsm/internal/failpoint"
+	"github.com/itsramhere/semlsm/internal/llm"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/merge"
+	"github.com/itsramhere/semlsm/internal/semantic"
+	"github.com/itsramhere/semlsm/internal/sstable"
+	"github.com/itsramhere/semlsm/internal/version"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // Semantic failpoints (P10.1 steps 7-9). after_manifest is hit by the engine

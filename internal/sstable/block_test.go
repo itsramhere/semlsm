@@ -7,7 +7,7 @@ import (
 	"sort"
 	"testing"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 func buildBlock(t *testing.T, entries []mEntry2) []byte {

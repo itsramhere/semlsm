@@ -15,10 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"semlsm"
-	"semlsm/internal/base"
-	"semlsm/internal/llm"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/llm"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // telemetry is one realistic record value.

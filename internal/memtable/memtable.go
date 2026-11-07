@@ -12,7 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 const (

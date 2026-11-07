@@ -6,7 +6,7 @@ package bloom
 import (
 	"fmt"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 const (

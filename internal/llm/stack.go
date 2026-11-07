@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // Config configures the reliability stack (P9.6).

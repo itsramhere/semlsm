@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"semlsm/internal/testutil"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 func openBudget(t *testing.T, fs vfs.FS, dir string, max int64) *Budget {

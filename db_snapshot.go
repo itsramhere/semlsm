@@ -3,7 +3,7 @@ package semlsm
 import (
 	"sync/atomic"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // Summary is defined fully in P8; the empty type keeps the API shape.

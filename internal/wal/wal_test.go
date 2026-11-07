@@ -6,9 +6,9 @@ import (
 	"io"
 	"testing"
 
-	"semlsm/internal/base"
-	"semlsm/internal/testutil"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 func encodeBatch(tb testing.TB, ts uint64, recs []base.Record) []byte {

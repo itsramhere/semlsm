@@ -3,7 +3,7 @@ package resolve
 import (
 	"testing"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 func TestResolveTruthTable(t *testing.T) {

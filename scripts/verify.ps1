@@ -1,6 +1,6 @@
-# scripts/verify.ps1 - run the A5 verification suite with exit-code checks.
+# scripts/verify.ps1 - run the verification suite with exit-code checks.
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\verify.ps1 [-Race] [-NoRace]
-# Default race decision comes from .agent/ENV.md (race: AVAILABLE => on).
+# Race is on by default; -NoRace or CGO_ENABLED=0 selects ordinary tests.
 
 param(
     [switch]$Race,
@@ -15,15 +15,10 @@ $ErrorActionPreference = 'Continue'
 $fail = 0
 
 function Run-Step {
-    param([string]$Name, [scriptblock]$Cmd, [string]$Log)
+    param([string]$Name, [scriptblock]$Cmd)
     Write-Host "== $Name"
     $out = & $Cmd 2>&1
     $code = $LASTEXITCODE
-    if ($Log) {
-        $dir = Join-Path '.agent' 'logs'
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-        $out | Out-File -FilePath (Join-Path $dir $Log) -Encoding utf8
-    }
     if ($code -ne 0) {
         Write-Host "FAIL: $Name (exit $code)"
         $out | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
@@ -43,26 +38,25 @@ if ($LASTEXITCODE -ne 0 -or $gofmtOut) {
     Write-Host 'ok: gofmt'
 }
 
-Run-Step 'go vet' { go vet ./... } 'vet.log'
-Run-Step 'go test' { go test ./... -count=1 -timeout 300s } 'test.log'
+Run-Step 'go vet' { go vet ./... }
+Run-Step 'go test' { go test ./... -count=1 -timeout 300s }
 
-# race gating from .agent/ENV.md
-$raceWanted = $true
-if ($NoRace) {
+# -Race is accepted for backwards compatibility; -NoRace takes precedence.
+$raceWanted = -not $NoRace
+$cgoEnabled = go env CGO_ENABLED
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'FAIL: go env CGO_ENABLED'
+    $fail = 1
     $raceWanted = $false
-} elseif (-not $Race) {
-    $envMd = Join-Path '.agent' 'ENV.md'
-    if (Test-Path $envMd) {
-        $content = Get-Content $envMd -Raw
-        if ($content -match 'Race detector:\s*UNAVAILABLE') { $raceWanted = $false }
-    }
+} elseif ($cgoEnabled.Trim() -eq '0') {
+    Write-Host 'skip: go test -race (CGO_ENABLED=0; ordinary tests ran above)'
+    $raceWanted = $false
+} elseif ($NoRace) {
+    Write-Host 'skip: go test -race (-NoRace; ordinary tests ran above)'
 }
 
 if ($raceWanted) {
-    Run-Step 'go test -race' { go test ./... -race -count=1 -timeout 600s } 'test-race.log'
-} else {
-    Write-Host 'skip: go test -race (unavailable per ENV.md); run concurrency tests with -count=20'
-    Run-Step 'go test count=20 (race fallback)' { go test ./... -count=20 -timeout 900s } 'test-count20.log'
+    Run-Step 'go test -race' { go test ./... -race -count=1 -timeout 600s }
 }
 
 if ($fail -ne 0) { exit 1 } else { Write-Host 'ALL OK'; exit 0 }

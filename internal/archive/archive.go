@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"sort"
 
-	"semlsm/internal/base"
-	"semlsm/internal/sstable"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/sstable"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // Write writes one tuple's dropped records to <dir>/<num>.sst and verifies

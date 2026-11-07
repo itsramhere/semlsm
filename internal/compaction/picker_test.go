@@ -3,9 +3,9 @@ package compaction
 import (
 	"testing"
 
-	"semlsm/internal/base"
-	"semlsm/internal/manifest"
-	"semlsm/internal/version"
+	"github.com/itsramhere/semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/manifest"
+	"github.com/itsramhere/semlsm/internal/version"
 )
 
 // fm builds one scripted file metadata entry. Smallest/Largest are internal

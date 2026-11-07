@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/testutil"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 // countingClient counts Complete calls and answers per the given modes.

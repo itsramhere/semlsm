@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"semlsm/internal/testutil"
-	"semlsm/internal/vfs"
+	"github.com/itsramhere/semlsm/internal/testutil"
+	"github.com/itsramhere/semlsm/internal/vfs"
 )
 
 func waitFor(t *testing.T, cond func() bool, msg string) {

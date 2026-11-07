@@ -5,7 +5,7 @@ import (
 	"container/heap"
 	"fmt"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // Iter is the source interface consumed by the merge iterator.

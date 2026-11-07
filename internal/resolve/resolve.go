@@ -6,7 +6,7 @@ package resolve
 import (
 	"fmt"
 
-	"semlsm/internal/base"
+	"github.com/itsramhere/semlsm/internal/base"
 )
 
 // Raw is the newest raw version with ts <= S, as found by the raw lookup.
