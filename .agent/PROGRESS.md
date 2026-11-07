@@ -201,6 +201,6 @@ fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
 - [x] Gate 9 (P9) — PASSED: 82b77ca, fix(P9) 28a0659 (M-025 CHANGES: breaker trial wedge, Cancel, limiter fail-fast + Open-time TokensPerMinute check, persist-failure keeps response), tag phase-9-done re-pointed to 28a0659, verdict M-026 APPROVED
 - [x] Gate 10 (P10) — PASSED: 90b8200, fix(P10) 7b024e1 (M-027 CHANGES: failed-job file cleanup, archive orphan sweep at Open, supervisor tests ported), tag phase-10-done re-pointed to 7b024e1, verdict M-028 APPROVED
 - [x] Gate 11 (P11) — PASSED, a79ec54, tag phase-11-done, verdict M-029 APPROVED (supervisor probed the group-bound edge case; its trailing-delimiter iterator test ported permanently as TestIteratorGroupBoundBelowDelimiter)
-- [ ] Gate 12 (P12) — tag phase-12-done on e811be1; verdict M-030 CHANGES -> fix(P12) re-run gated, GATE G-039
+- [x] Gate 12 (P12) — PASSED: e811be1, fix(P12) f02d444 (M-030 CHANGES: GetArchived delegates past the run, tombstone -> NotFound, sup tests ported), tag phase-12-done re-pointed to f02d444, verdict M-031 APPROVED
 - [ ] Gate 13 (P13) — tagged phase-13-done
 - [ ] Gate 14 (P14) — tagged phase-14-done
