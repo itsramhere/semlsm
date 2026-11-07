@@ -64,6 +64,13 @@ func (db *DB) GetArchived(key []byte, ts uint64) (Result, error) {
 	if !best.Found || bestNum == 0 {
 		return Result{}, fmt.Errorf("%w: no covering archived segment for %q at %d", base.ErrNotArchived, key, ts)
 	}
+	// Past the run the archive is not authoritative: the true value at ts
+	// comes from the normal resolution (raw versions above the dropped
+	// range), so delegate to GetAt. GetArchived is always the exact value
+	// at ts (M-030 item 1).
+	if ts > best.MaxTs {
+		return db.GetAt(key, ts)
+	}
 
 	r, err := archive.Open(db.opts.FS, archive.Path(db.archiveDir(), bestNum))
 	if err != nil {
@@ -77,6 +84,10 @@ func (db *DB) GetArchived(key []byte, ts uint64) (Result, error) {
 	}
 	if !ok {
 		return Result{}, fmt.Errorf("%w: %q at %d not in segment %d", base.ErrNotArchived, key, ts, bestNum)
+	}
+	if rec.Kind == base.KindDelete {
+		// A dropped tombstone: the key is absent at that ts (M-030 item 2).
+		return Result{Kind: ResultNotFound, Key: copyBytes(key), VersionTs: rec.Ts}, nil
 	}
 	return Result{
 		Kind:      ResultExact,

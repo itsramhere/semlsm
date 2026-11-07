@@ -768,3 +768,71 @@ func TestGetArchivedAndIntegrity(t *testing.T) {
 		t.Fatalf("normal read harmed by a missing archive: %+v err=%v", res, err)
 	}
 }
+
+// archivedDBWithTombstone builds an archived DB of 100 versions of one key,
+// optionally with a Delete at position delAt.
+func archivedDBWithTombstone(t *testing.T, delAt int) (*DB, []byte, []uint64) {
+	db, clk, _ := openSemDB(t, "db", llm.NewMock(llm.MockValid), func(o *Options) { o.ArchiveRaw = true })
+	key := []byte("agent/7/state")
+	var tss []uint64
+	for i := 0; i < 100; i++ {
+		var ts uint64
+		var err error
+		if i == delAt {
+			ts, err = db.Delete(key)
+		} else {
+			ts, err = db.Put(key, []byte(fmt.Sprintf("v%03d", i)))
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		tss = append(tss, ts)
+	}
+	driveDown(t, db)
+	clk.Set(semStart.Add(5 * time.Hour))
+	if err := db.CompactLevel(context.Background(), 4); err != nil {
+		t.Fatal(err)
+	}
+	if db.Stats().SemanticTuplesCreated == 0 {
+		t.Skip("no tuple")
+	}
+	return db, key, tss
+}
+
+// TestGetArchivedPastRun ports the supervisor's correctness test (M-030
+// item 1): GetArchived at a ts past the key's dropped run must return the
+// true value at that ts (the newer raw version), not the archived run's
+// last version.
+func TestGetArchivedPastRun(t *testing.T) {
+	db, key, tss := archivedDBWithTombstone(t, -1)
+	defer db.Close()
+	head := tss[len(tss)-1]
+	r, err := db.GetArchived(key, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Kind != ResultExact || r.VersionTs != head || string(r.Value) != "v099" {
+		t.Fatalf("GetArchived(head) = %+v, want the raw head v099@%d", r, head)
+	}
+}
+
+// TestGetArchivedTombstone ports the supervisor's correctness test (M-030
+// item 2): a dropped tombstone must not come back as an Exact empty value.
+func TestGetArchivedTombstone(t *testing.T) {
+	db, key, tss := archivedDBWithTombstone(t, 50)
+	defer db.Close()
+	r, err := db.GetArchived(key, tss[50])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Kind == ResultExact {
+		t.Fatalf("GetArchived at a deleted version returned Exact value %q@%d", r.Value, r.VersionTs)
+	}
+	if r.Kind != ResultNotFound {
+		t.Fatalf("want NotFound at the tombstone, got %+v", r)
+	}
+	r, err = db.GetArchived(key, tss[60])
+	if err != nil || r.Kind != ResultExact || string(r.Value) != "v060" {
+		t.Fatalf("GetArchived v060: %+v err=%v", r, err)
+	}
+}
