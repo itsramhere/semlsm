@@ -669,7 +669,7 @@ func (db *DB) cleanupOrphans(replayedWals []uint64) error {
 		}
 		r.Close()
 	}
-	archDir := filepath.Join(db.dir, "archive")
+	archDir := db.archiveDir()
 	if ents, err := db.opts.FS.List(archDir); err == nil {
 		removed := false
 		for _, e := range ents {

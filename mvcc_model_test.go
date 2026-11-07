@@ -2,8 +2,11 @@ package semlsm
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -596,5 +599,172 @@ func TestIteratorGroupBoundBelowDelimiter(t *testing.T) {
 		if !found {
 			t.Errorf("end=%q: key %q inside the range but missing from iterator (GetAt=Summarized)", end, key)
 		}
+	}
+}
+
+// TestGetArchivedAndIntegrity is the P12.2 test: with ArchiveRaw on, every
+// dropped version is recoverable exactly through GetArchived; VerifyIntegrity
+// recomputes SourceCRC32 from the archives and detects tampering; a deleted
+// archive file gives ErrNotArchived without harming normal reads.
+func TestGetArchivedAndIntegrity(t *testing.T) {
+	fs := vfs.NewMemFS()
+	clk := base.NewManualClock(semStart)
+	mock := llm.NewMock(llm.MockValid)
+	stack := newSemStack(t, fs, "db", mock, 0)
+	o := semOptions(fs, clk, stack)
+	o.ArchiveRaw = true
+	db, err := Open("db", o)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := []byte("agent/1/a")
+	type droppedRec struct {
+		ts uint64
+		v  string
+	}
+	var dropped []droppedRec // the versions the ModeState head leaves droppable
+	var head string
+	for i := 0; i < 14; i++ {
+		v := fmt.Sprintf("v%02d %s", i, strings.Repeat("a", 290))
+		ts, err := db.Put(key, []byte(v))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 13 {
+			dropped = append(dropped, droppedRec{ts, v})
+		}
+		head = v
+	}
+	_ = head
+	driveDown(t, db)
+	clk.Set(semStart.Add(2 * time.Hour))
+	if err := db.CompactLevel(context.Background(), base.NumLevels-1); err != nil {
+		t.Fatal(err)
+	}
+	if st := db.Stats(); st.SemanticTuplesCreated == 0 {
+		t.Fatal("no tuple: scenario not reached")
+	}
+
+	// Every dropped version is recoverable exactly from the archive.
+	for _, d := range dropped {
+		res, err := db.GetArchived(key, d.ts)
+		if err != nil {
+			t.Fatalf("GetArchived %d: %v", d.ts, err)
+		}
+		if res.Kind != ResultExact || res.VersionTs != d.ts || string(res.Value) != d.v {
+			t.Fatalf("GetArchived %d: kind=%d ts=%d val=%q", d.ts, res.Kind, res.VersionTs, res.Value)
+		}
+	}
+	// The head version is not in any archive run: it is raw, and the
+	// archive tier does not serve it below its own range either.
+	if _, err := db.GetArchived(key, 0); !errors.Is(err, base.ErrNotArchived) {
+		t.Fatalf("GetArchived below the run: %v, want ErrNotArchived", err)
+	}
+
+	// A custom ArchiveDir is honored.
+	db.Close()
+	fs2 := vfs.NewMemFS()
+	clk2 := base.NewManualClock(semStart)
+	stack2 := newSemStack(t, fs2, "db", llm.NewMock(llm.MockValid), 0)
+	o2 := semOptions(fs2, clk2, stack2)
+	o2.ArchiveRaw = true
+	o2.ArchiveDir = "cold-store"
+	db2, err := Open("db", o2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	for i := 0; i < 14; i++ {
+		if _, err := db2.Put(key, []byte(fmt.Sprintf("v%02d %s", i, strings.Repeat("a", 290)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	driveDown(t, db2)
+	clk2.Set(semStart.Add(2 * time.Hour))
+	if err := db2.CompactLevel(context.Background(), base.NumLevels-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db2.GetArchived(key, uint64(clk2.Now().UnixNano())); err == nil {
+		// at the head ts the newest run may cover it or not; just exercise it
+		_ = err
+	}
+	if ents, err := fs2.List("cold-store"); err != nil || len(ents) == 0 {
+		t.Fatalf("ArchiveDir not honored: entries=%v err=%v", ents, err)
+	}
+
+	// VerifyIntegrity recomputes SourceCRC32 from the archives: clean now.
+	rep, err := db2.VerifyIntegrity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Problems) > 0 {
+		t.Fatalf("clean verify reported: %v", rep.Problems)
+	}
+
+	// Tampering: flip a byte inside the archive segment; VerifyIntegrity
+	// must report the CRC mismatch.
+	archDir := "cold-store"
+	ents, err := fs2.List(archDir)
+	if err != nil || len(ents) == 0 {
+		t.Fatalf("list archive: %v %v", ents, err)
+	}
+	victim := filepath.Join(archDir, ents[0].Name)
+	// vfs.File has no WriteAt: rewrite the whole file with one flipped byte.
+	rf, err := fs2.Open(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rf)
+	rf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	flip := 200
+	if flip >= len(data) {
+		flip = len(data) / 2
+	}
+	data[flip] ^= 0xFF
+	wf, err := fs2.Create(victim) // truncates
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wf.Write(data); err != nil {
+		wf.Close()
+		t.Fatal(err)
+	}
+	if err := wf.Sync(); err != nil {
+		wf.Close()
+		t.Fatal(err)
+	}
+	wf.Close()
+	rep, err = db2.VerifyIntegrity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundCRCProblem := false
+	for _, p := range rep.Problems {
+		// A flipped byte surfaces as a CRC mismatch, a read error or a
+		// structural failure; any archive-related problem counts.
+		if strings.Contains(p, "archive") {
+			foundCRCProblem = true
+		}
+	}
+	if !foundCRCProblem {
+		t.Fatalf("tampered archive not detected: %v", rep.Problems)
+	}
+
+	// Deleting the archive: GetArchived -> ErrNotArchived; normal reads are
+	// unharmed.
+	if err := fs2.Remove(victim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db2.GetArchived(key, dropped[0].ts); err == nil {
+		t.Fatal("GetArchived must fail after the archive file is gone")
+	} else if !errors.Is(err, base.ErrNotArchived) {
+		t.Fatalf("want ErrNotArchived, got %v", err)
+	}
+	if res, err := db2.Get(key); err != nil || res.Kind != ResultExact {
+		t.Fatalf("normal read harmed by a missing archive: %+v err=%v", res, err)
 	}
 }

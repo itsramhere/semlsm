@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"semlsm/internal/archive"
 	"semlsm/internal/base"
 	"semlsm/internal/checkpoint"
 	"semlsm/internal/compaction"
@@ -424,7 +425,7 @@ func (db *DB) enqueueDyingArchives(ckptNum uint64) {
 	for _, t := range r.Tuples() {
 		if t.ArchiveFileNum != 0 {
 			db.obsolete.Enqueue(version.ObsoleteFile{
-				Path: filepath.Join(db.dir, "archive", fmt.Sprintf("%06d.sst", t.ArchiveFileNum)),
+				Path: archive.Path(db.archiveDir(), t.ArchiveFileNum),
 				Num:  t.ArchiveFileNum,
 			})
 		}
@@ -602,7 +603,7 @@ func (db *DB) verifyArchiveCrc(rep *VerifyReport, t checkpoint.TupleMeta) {
 	if t.ArchiveFileNum == 0 {
 		return
 	}
-	path := filepath.Join(db.dir, "archive", sstable.Name(t.ArchiveFileNum))
+	path := archive.Path(db.archiveDir(), t.ArchiveFileNum)
 	r, err := sstable.OpenReader(db.opts.FS, path)
 	if err != nil {
 		rep.Problems = append(rep.Problems, fmt.Sprintf("tuple %d: archive %d missing or unreadable: %v", t.ID, t.ArchiveFileNum, err))
@@ -887,7 +888,7 @@ func (db *DB) semanticDeps() compaction.SemanticDeps {
 	return compaction.SemanticDeps{
 		FS:             db.opts.FS,
 		Dir:            db.dir,
-		ArchiveDir:     filepath.Join(db.dir, "archive"),
+		ArchiveDir:     db.archiveDir(),
 		GroupDepth:     db.opts.GroupDepth,
 		GroupDelimiter: db.opts.GroupDelimiter,
 		PolicyFor: func(key []byte) base.Policy {
@@ -1057,7 +1058,7 @@ func (db *DB) removeSemanticFiles(res *compaction.SemanticResult) {
 		_ = db.opts.FS.Remove(filepath.Join(db.dir, ckptName(res.Ckpt.FileNum)))
 	}
 	for _, num := range res.Archives {
-		_ = db.opts.FS.Remove(filepath.Join(db.dir, "archive", sstable.Name(num)))
+		_ = db.opts.FS.Remove(archive.Path(db.archiveDir(), num))
 	}
 	_ = db.opts.FS.SyncDir(db.dir)
 }

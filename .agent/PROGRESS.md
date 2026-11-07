@@ -158,8 +158,12 @@ fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
 **Gate 11:** pass across all seeds — gofmt/vet clean; `go test ./... -race -count=1` all 16 packages (root 182 s). BUG the master test caught (pre-existing since P5.6): Snapshot.NewIterator handed the snapshot's own pinned readState to the iterator, whose Close released the SNAPSHOT's reference — every snapshot iterator consumed one ref of the pinned version, driving the refcount below zero (panic "Unref below zero" at Close, then the panic-time deferred Release deadlocked on db.mu). Fixed: Snapshot.NewIterator takes its own reference on the pinned version. The model test needed two test-side fixes as well: writers must go through Batch.Put/Delete (appending to b.recs directly bypasses last-write-wins and the engine rightly rejects the duplicate internal key at flush), and phase B needs an explicit Flush when the workload does not fill the memtable.
 
 ## P12. Cold archive tier
-- [ ] **P12.1** `internal/archive`: dropped segment raw records in standard SST at `archive/%06d.sst` (or ArchiveDir); written before manifest commit; orphans removed at startup; different volume -> copy with sync.
-- [ ] **P12.2** `GetArchived(key, ts)`: tuple lookup -> archive reader -> newest version <= ts in run, else `ErrNotArchived`. `CheckpointInfo.ArchiveAvailable` set. Tests: exact recoverability; VerifyIntegrity recomputes SourceCRC32 and detects tampering; missing archive file -> ErrNotArchived without harming normal reads.
+- [x] **P12.1** `internal/archive`: a dropped segment's raw records in a standard SST at `archive/%06d.sst`, or `ArchiveDir` if set. On a different volume, copy with sync; no rename needed since it is created there. It's written before the manifest commit, and orphans are removed at startup.
+  -> internal/archive/archive.go: Write (internal-key order, read-back SourceCRC verification), Path, Open, Lookup over a plain sstable.Reader; compaction's writeArchive delegates to it (no cycle: archive uses only sstable/base/vfs). The segment is created in place (no cross-volume rename), written and synced before the manifest edit, and startup cleanup removes archive SSTs no live tuple meta references (M-027 item 2). ArchiveDir is now honored everywhere: job writes, the Open-time orphan sweep and the dying-checkpoint deleter go through db.archiveDir().
+- [x] **P12.2** `GetArchived(key, ts)`: tuple lookup -> archive reader -> newest version <= ts in the run. `ErrNotArchived` otherwise.
+  -> db_archive.go: GetArchived walks the key's group refs (TsFrom <= ts), keeps the entry with the largest MinTs <= ts, requires its tuple meta ArchiveFileNum, opens the segment and returns the newest version <= ts as ResultExact. ErrNotArchived (base sentinel, re-exported) for no covering tuple, non-archived tuples and missing/unreadable segments; normal reads are never harmed. CheckpointInfo.ArchiveAvailable was already set in P7.4. Tests (TestGetArchivedAndIntegrity): all 13 dropped versions recovered exactly, custom ArchiveDir written and listed, VerifyIntegrity clean before tampering / reports the flipped byte after / a deleted segment gives ErrNotArchived while Get stays Exact; internal/archive has a direct unit test (mismatched CRC rejected at write, lookups bounded by the run).
+
+**Gate 12:** pass — gofmt/vet clean; `go test ./... -race -count=1` all 17 packages (root 153 s; internal/archive added with 1 unit test).
 
 **Gate 12:** pass.
 
@@ -197,6 +201,6 @@ fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
 - [x] Gate 9 (P9) — PASSED: 82b77ca, fix(P9) 28a0659 (M-025 CHANGES: breaker trial wedge, Cancel, limiter fail-fast + Open-time TokensPerMinute check, persist-failure keeps response), tag phase-9-done re-pointed to 28a0659, verdict M-026 APPROVED
 - [x] Gate 10 (P10) — PASSED: 90b8200, fix(P10) 7b024e1 (M-027 CHANGES: failed-job file cleanup, archive orphan sweep at Open, supervisor tests ported), tag phase-10-done re-pointed to 7b024e1, verdict M-028 APPROVED
 - [x] Gate 11 (P11) — PASSED, a79ec54, tag phase-11-done, verdict M-029 APPROVED (supervisor probed the group-bound edge case; its trailing-delimiter iterator test ported permanently as TestIteratorGroupBoundBelowDelimiter)
-- [ ] Gate 12 (P12) — tagged phase-12-done
+- [ ] Gate 12 (P12) — tagged phase-12-done (verdict pending)
 - [ ] Gate 13 (P13) — tagged phase-13-done
 - [ ] Gate 14 (P14) — tagged phase-14-done

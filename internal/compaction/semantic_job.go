@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"semlsm/internal/archive"
 	"semlsm/internal/base"
 	"semlsm/internal/checkpoint"
 	"semlsm/internal/failpoint"
@@ -583,77 +584,16 @@ func failureClass(err error) string {
 	}
 }
 
-// writeArchive writes one tuple's dropped records to <archive>/<num>.sst and
-// verifies SourceCRC32 by reading the file back (P10.1 step 9). The file
-// number was allocated when the draft was built.
+// writeArchive writes one tuple's dropped records to the archive tier and
+// verifies SourceCRC32 by reading the file back (P10.1 step 9, P12.1). The
+// file number was allocated when the draft was built.
 func writeArchive(d SemanticDeps, dr *tupleDraft) error {
 	num := dr.meta.ArchiveFileNum
 	if num == 0 {
 		return errors.New("semantic: archive file number not allocated")
 	}
-	aw := NewOutputWriter(d.FS, d.ArchiveDir, 1<<30, func() uint64 { return num })
-	// The SST requires internal-key order (key asc, ts desc, I3); the
-	// segment arrives (ts asc, key asc), so reorder for the archive.
-	ordered := append([]base.Record(nil), dr.recs...)
-	sort.SliceStable(ordered, func(a, b int) bool {
-		if c := base.CompareUser(ordered[a].Key, ordered[b].Key); c != 0 {
-			return c < 0
-		}
-		return ordered[a].Ts > ordered[b].Ts
-	})
-	for _, r := range ordered {
-		if err := aw.Add(base.MakeInternalKey(r.Key, r.Ts, r.Kind), r.Value); err != nil {
-			aw.Abort()
-			return fmt.Errorf("semantic: archive %d: %w", num, err)
-		}
-	}
-	outs, err := aw.Finish()
-	if err != nil {
-		aw.Abort()
-		return fmt.Errorf("semantic: archive %d finish: %w", num, err)
-	}
-	if len(outs) != 1 {
-		aw.Abort()
-		return fmt.Errorf("semantic: archive %d produced %d files", num, len(outs))
-	}
-	// Verify: read back, order by (ts asc, key asc), recompute the CRC.
-	r, err := sstable.OpenReader(d.FS, filepath.Join(d.ArchiveDir, sstable.Name(num)))
-	if err != nil {
-		return fmt.Errorf("semantic: archive %d verify open: %w", num, err)
-	}
-	defer r.Close()
-	var back []base.Record
-	it := r.NewIterator()
-	for it.First(); it.Valid(); it.Next() {
-		user, ts, kind, ok := base.SplitInternalKey(it.Key())
-		if !ok {
-			it.Close()
-			return fmt.Errorf("semantic: archive %d verify: bad internal key", num)
-		}
-		// Copy: the iterator's buffers are only valid until the next Next.
-		back = append(back, base.Record{
-			Key:   append([]byte(nil), user...),
-			Ts:    ts,
-			Kind:  kind,
-			Value: append([]byte(nil), it.Value()...),
-		})
-	}
-	if err := it.Err(); err != nil {
-		it.Close()
-		return fmt.Errorf("semantic: archive %d verify read: %w", num, err)
-	}
-	it.Close()
-	if uint64(len(back)) != dr.meta.SourceCount {
-		return fmt.Errorf("semantic: archive %d verify: %d records, want %d", num, len(back), dr.meta.SourceCount)
-	}
-	sort.Slice(back, func(a, b int) bool {
-		if back[a].Ts != back[b].Ts {
-			return back[a].Ts < back[b].Ts
-		}
-		return string(back[a].Key) < string(back[b].Key)
-	})
-	if crc := base.SourceCRC(back); crc != dr.meta.SourceCRC32 {
-		return fmt.Errorf("semantic: archive %d verify: CRC %08x, want %08x", num, crc, dr.meta.SourceCRC32)
+	if err := archive.Write(d.FS, d.ArchiveDir, num, dr.recs, dr.meta.SourceCount, dr.meta.SourceCRC32); err != nil {
+		return fmt.Errorf("semantic: %w", err)
 	}
 	return nil
 }
