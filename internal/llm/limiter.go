@@ -71,10 +71,17 @@ func EstimateTokens(r Request) int {
 
 // Wait takes one concurrency slot and blocks until both buckets can cover
 // one request and its estimated token cost. On ctx cancellation the slot is
-// returned and no tokens are charged.
+// returned and no tokens are charged. A request larger than the token burst
+// (one minute of TokensPerMinute) could never be satisfied, so it fails
+// immediately with an ErrPermanent-wrapped error instead of blocking forever
+// (M-025 item 3).
 func (l *Limiter) Wait(ctx context.Context, tokens int) error {
 	if tokens < 1 {
 		tokens = 1
+	}
+	if float64(tokens) > l.tokBurst {
+		return fmt.Errorf("%w: request exceeds TokensPerMinute (%d estimated tokens > burst %d)",
+			ErrPermanent, tokens, int(l.tokBurst))
 	}
 	select {
 	case l.sem <- struct{}{}:
@@ -111,6 +118,10 @@ func (l *Limiter) Release() { <-l.sem }
 
 // InFlight returns the number of currently held concurrency slots (tests).
 func (l *Limiter) InFlight() int { return len(l.sem) }
+
+// TokensPerMinute returns the token burst — the largest request estimate the
+// limiter can ever admit (Options validation, M-025 item 3).
+func (l *Limiter) TokensPerMinute() int { return int(l.tokBurst) }
 
 // delayLocked computes how long until both buckets can satisfy the request.
 // Rates are positive by construction, so the result is finite.

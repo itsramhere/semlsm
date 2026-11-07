@@ -9,6 +9,7 @@ import (
 
 	"semlsm/internal/base"
 	"semlsm/internal/llm"
+	"semlsm/internal/semantic"
 	"semlsm/internal/vfs"
 )
 
@@ -218,6 +219,19 @@ func (o Options) validate() error {
 	}
 	if o.DefaultPolicy.Mode != ModeDisabled && o.DefaultPolicy.MinBatch > o.DefaultPolicy.MaxBatch {
 		return fmt.Errorf("options: default policy MinBatch > MaxBatch")
+	}
+	// The LLM rate limit must be able to admit a worst-case request
+	// (M-025 item 3): EstimateTokens of a MaxChunkBytes-sized prompt plus
+	// the completion budget. Otherwise semantic compaction would fail on
+	// every call with "request exceeds TokensPerMinute".
+	if o.Summarizer != nil {
+		if r, ok := o.Summarizer.(interface{ TokensPerMinute() int }); ok {
+			worst := o.MaxChunkBytes/3 + semantic.MaxOutputTokens
+			if worst > r.TokensPerMinute() {
+				return fmt.Errorf("options: TokensPerMinute (%d) cannot cover a worst-case request of %d estimated tokens (MaxChunkBytes %d / 3 + MaxOutputTokens %d); raise the token rate or lower MaxChunkBytes",
+					r.TokensPerMinute(), worst, o.MaxChunkBytes, semantic.MaxOutputTokens)
+			}
+		}
 	}
 	return nil
 }

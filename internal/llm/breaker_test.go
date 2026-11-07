@@ -134,3 +134,77 @@ func TestBreakerSuccessResetsStreak(t *testing.T) {
 		t.Fatalf("streak must reset on success, got %v", err)
 	}
 }
+
+// Ported from the supervisor's TestSupBreakerHalfOpenPermanentDoesNotWedge
+// (M-025 item 1): a trial that ends in a non-transient error must resolve
+// the trial. A 4xx proves the endpoint answered, so the breaker closes.
+func TestBreakerTrialPermanentErrorCloses(t *testing.T) {
+	clk := NewManualClock(time.Unix(1000, 0))
+	b := NewBreaker(clk)
+	for i := 0; i < DefaultTripThreshold; i++ {
+		b.RecordError(fmt.Errorf("%w: 503", ErrTransient))
+	}
+	clk.Advance(DefaultOpenFor + time.Second)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("trial denied: %v", err)
+	}
+	b.RecordError(fmt.Errorf("%w: 400", ErrPermanent))
+	state, _ := b.State()
+	if state != "closed" {
+		t.Fatalf("state after permanent trial outcome: %s, want closed", state)
+	}
+	clk.Advance(MaxOpenFor + time.Hour)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("breaker wedged after permanent error on trial: %v", err)
+	}
+}
+
+// Ported from the supervisor's TestSupBreakerHalfOpenCancelDoesNotWedge
+// (M-025 item 1): a cancelled trial is not evidence of unhealth either.
+func TestBreakerTrialContextErrorCloses(t *testing.T) {
+	clk := NewManualClock(time.Unix(1000, 0))
+	b := NewBreaker(clk)
+	for i := 0; i < DefaultTripThreshold; i++ {
+		b.RecordError(fmt.Errorf("%w: 503", ErrTransient))
+	}
+	clk.Advance(DefaultOpenFor + time.Second)
+	_ = b.Allow()
+	b.RecordError(context.Canceled)
+	state, _ := b.State()
+	if state != "closed" {
+		t.Fatalf("state after cancelled trial: %s, want closed", state)
+	}
+	clk.Advance(MaxOpenFor + time.Hour)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("breaker wedged after cancelled trial: %v", err)
+	}
+}
+
+// M-025 item 2: Cancel gives a half-open trial back when the call never
+// reached the upstream client; the next Allow grants a fresh trial.
+func TestBreakerCancelReturnsTrial(t *testing.T) {
+	clk := NewManualClock(time.Unix(1000, 0))
+	b := NewBreaker(clk)
+	for i := 0; i < DefaultTripThreshold; i++ {
+		b.RecordError(fmt.Errorf("%w: 503", ErrTransient))
+	}
+	clk.Advance(DefaultOpenFor + time.Second)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("trial denied: %v", err)
+	}
+	b.Cancel() // the call never reached upstream
+	state, _ := b.State()
+	if state != "open" {
+		t.Fatalf("state after cancel: %s, want open", state)
+	}
+	// The window had already elapsed, so the next call gets a fresh trial.
+	if err := b.Allow(); err != nil {
+		t.Fatalf("fresh trial after cancel: %v", err)
+	}
+	b.RecordSuccess()
+	// Cancel outside half-open is a no-op.
+	b.Cancel()
+	if err := b.Allow(); err != nil {
+		t.Fatalf("closed breaker after no-op cancel: %v", err)
+	}
+}

@@ -92,32 +92,57 @@ func (b *Breaker) Allow() error {
 func (b *Breaker) RecordSuccess() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.state = breakerClosed
-	b.streak = 0
-	b.trialTaken = false
-	b.openFor = b.base
+	b.close()
 }
 
-// RecordError records a call outcome. Only ErrTransient errors count toward
-// the breaker; a success is RecordSuccess, and permanent or context errors
-// say nothing about service health, so they are ignored here. In half-open
-// state a transient failure re-opens the breaker with a doubled duration.
+// RecordError records a call outcome. While closed, only ErrTransient
+// failures count toward the trip threshold; permanent and context errors say
+// nothing about availability and are ignored. In half-open state the trial
+// always ends (M-025 item 1): a transient failure re-opens the breaker with
+// a doubled duration, and ANY other error closes it — a 4xx proves the
+// endpoint answered, and a client-side cancellation is not evidence of
+// unhealth. Neither may wedge the breaker in half-open.
 func (b *Breaker) RecordError(err error) {
-	if !errors.Is(err, ErrTransient) {
-		return
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	switch b.state {
 	case breakerClosed:
-		b.streak++
-		if b.streak >= b.threshold {
-			b.trip(b.base)
+		if errors.Is(err, ErrTransient) {
+			b.streak++
+			if b.streak >= b.threshold {
+				b.trip(b.base)
+			}
 		}
 	case breakerHalfOpen:
-		b.trip(min(b.openFor*2, MaxOpenFor))
+		if errors.Is(err, ErrTransient) {
+			b.trip(min(b.openFor*2, MaxOpenFor))
+			return
+		}
+		b.close()
 	default: // open: the call was not allowed; ignore
 	}
+}
+
+// Cancel gives a half-open trial back when the call never reached the
+// upstream client — ctx cancellation at the limiter, a budget or limiter
+// refusal after Allow (M-025 item 2). The breaker returns to the open state
+// it was in: if the cool-down window has since elapsed, the next Allow
+// grants a fresh trial. Outside half-open it is a no-op.
+func (b *Breaker) Cancel() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == breakerHalfOpen {
+		b.state = breakerOpen
+		b.trialTaken = false
+	}
+}
+
+// close returns the breaker to closed and resets all counters (must hold mu).
+func (b *Breaker) close() {
+	b.state = breakerClosed
+	b.streak = 0
+	b.trialTaken = false
+	b.openFor = b.base
 }
 
 // trip opens the breaker for the given duration (must hold mu).

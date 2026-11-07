@@ -312,11 +312,98 @@ func TestStackContextCancelReleasesEverything(t *testing.T) {
 		t.Fatal("cancelled call must fail")
 	}
 	// The estimate was refunded and the limiter slot returned.
-	if s.limiter.InFlight() != 0 {
-		t.Fatalf("limiter slot leaked: %d", s.limiter.InFlight())
+	if n := s.limiter.(*Limiter).InFlight(); n != 0 {
+		t.Fatalf("limiter slot leaked: %d", n)
 	}
 	clk.Advance(61 * time.Second)
 	if err := s.budget.Reserve(1000); err != nil {
 		t.Fatalf("budget must be fully refundable: %v", err)
+	}
+}
+
+// failingLimiter stands in for the real limiter to drive the exact failure
+// paths of Stack.Complete deterministically.
+type failingLimiter struct{ err error }
+
+func (f *failingLimiter) Wait(ctx context.Context, tokens int) error { return f.err }
+func (f *failingLimiter) Release()                                   {}
+func (f *failingLimiter) TokensPerMinute() int                       { return 1 << 30 }
+
+// M-025 item 2, end to end: a half-open trial whose call dies at the limiter
+// (ctx cancellation) must be given back, or the breaker wedges forever.
+func TestStackTrialCancelledAtLimiterDoesNotWedge(t *testing.T) {
+	clk := NewManualClock(time.Unix(1_000_000, 0))
+	cfg := stackConfig("db", 1_000_000)
+	cfg.CacheMaxBytes = 0
+	cfg.Clock = clk
+	next := &countingClient{}
+	s, err := NewSummarizer(next, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{System: "sys", User: "usr", MaxOutputTokens: 30}
+
+	// Trip the breaker through the stack.
+	next.failWith = fmt.Errorf("%w: down", ErrTransient)
+	for i := 0; i < DefaultTripThreshold; i++ {
+		if _, err := s.Complete(context.Background(), req); !errors.Is(err, ErrTransient) {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	clk.Advance(61 * time.Second) // window elapsed -> next Allow is a trial
+
+	realLimiter := s.limiter
+	s.limiter = &failingLimiter{err: context.Canceled}
+	if _, err := s.Complete(context.Background(), req); err == nil {
+		t.Fatal("limiter failure must surface")
+	}
+	next.failWith = nil
+	next.resp = validResponse("v")
+
+	// Without the Cancel fix the breaker would be stuck in half-open with a
+	// taken trial and refuse everything from here on.
+	s.limiter = realLimiter
+	resp, err := s.Complete(context.Background(), req)
+	if err != nil {
+		t.Fatalf("breaker wedged after a trial cancelled at the limiter: %v", err)
+	}
+	if resp.Text != "v" || next.calls != DefaultTripThreshold+1 {
+		t.Fatalf("resp=%q calls=%d", resp.Text, next.calls)
+	}
+	if state, _ := s.BreakerState(); state != "closed" {
+		t.Fatalf("state after recovery: %s", state)
+	}
+}
+
+// M-025 item 4: a usage-persist failure after a successful call must not
+// discard the paid-for response.
+func TestStackPersistFailureKeepsResponse(t *testing.T) {
+	fs := vfs.NewFaultFS(vfs.NewMemFS())
+	cfg := stackConfig("db", 1_000_000)
+	cfg.FS = fs
+	cfg.CacheMaxBytes = 0
+	next := &countingClient{resp: validResponse("v")}
+	s, err := NewSummarizer(next, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("disk full")
+	fs.Inject("Sync", 1, boom) // the usage.json.tmp sync inside budget.Record
+
+	resp, err := s.Complete(context.Background(), Request{System: "sys", User: "usr", MaxOutputTokens: 30})
+	if err != nil {
+		t.Fatalf("response must survive a persist failure: %v", err)
+	}
+	if resp.Text != "v" {
+		t.Fatalf("resp=%q", resp.Text)
+	}
+	// The in-memory accounting was applied before the failed write.
+	in, out, calls := s.budget.Used()
+	if in != 10 || out != 5 || calls != 1 {
+		t.Fatalf("budget after failed persist: %d/%d calls=%d", in, out, calls)
+	}
+	// The next persist (without the fault) lands the totals on disk.
+	if err := s.budget.Record(1, Response{InputTokens: 1}); err != nil {
+		t.Fatalf("persist after clearing the fault: %v", err)
 	}
 }

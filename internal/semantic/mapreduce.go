@@ -20,6 +20,11 @@ var ErrPoorCompression = errors.New("semantic: summary does not compress the sou
 // reduceFanIn is the number of partial summaries merged per reduce call.
 const reduceFanIn = 8
 
+// MaxOutputTokens is the completion budget of every map and reduce call.
+// It is exported so Options validation can check that the LLM rate limit
+// covers a worst-case request (M-025 item 3).
+const MaxOutputTokens = 2048
+
 // Usage accumulates the LLM consumption of one Summarize call (P8.6).
 type Usage struct {
 	InputTokens  int64
@@ -169,7 +174,7 @@ func (s *Summarizer) mapCall(ctx context.Context, group string, index, total int
 	req := llm.Request{
 		System:          SystemPrompt(),
 		User:            BuildUserPrompt(group, index, total, c),
-		MaxOutputTokens: 2048,
+		MaxOutputTokens: MaxOutputTokens,
 		Metadata: map[string]string{
 			"stage":          "map",
 			"prompt_version": strconv.Itoa(PromptVersion),
@@ -204,7 +209,7 @@ func (s *Summarizer) reduceCall(ctx context.Context, group string, parts []Narra
 	req := llm.Request{
 		System:          ReduceSystemPrompt(),
 		User:            BuildReduceUserPrompt(group, jsons),
-		MaxOutputTokens: 2048,
+		MaxOutputTokens: MaxOutputTokens,
 		Metadata: map[string]string{
 			"stage":          "reduce",
 			"prompt_version": strconv.Itoa(PromptVersion),

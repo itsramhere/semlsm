@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -207,4 +208,40 @@ func TestEstimateTokens(t *testing.T) {
 	if got := EstimateTokens(Request{}); got != 1 {
 		t.Fatalf("empty estimate: %d, want 1", got)
 	}
+}
+
+// Ported from the supervisor's TestSupLimiterOversizeRequest (M-025 item 3):
+// a request larger than one minute of tokens could never be satisfied, so it
+// must fail fast instead of holding a slot until the context ends.
+func TestLimiterOversizeRequestFailsFast(t *testing.T) {
+	l, err := NewLimiter(60, 1000, 1, NewManualClock(time.Unix(1000, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.Wait(ctx, 5000) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("oversize request must not succeed")
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("blocked until the ctx deadline instead of failing fast: %v", err)
+		}
+		if !errors.Is(err, ErrPermanent) {
+			t.Fatalf("want ErrPermanent, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("oversize request blocked forever")
+	}
+	if l.InFlight() != 0 {
+		t.Fatalf("slot leaked by the oversize request: %d", l.InFlight())
+	}
+	// A request exactly at the burst still goes through.
+	if err := l.Wait(context.Background(), 1000); err != nil {
+		t.Fatalf("at-burst request: %v", err)
+	}
+	l.Release()
 }

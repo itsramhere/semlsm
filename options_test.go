@@ -1,11 +1,14 @@
 package semlsm
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"semlsm/internal/base"
+	"semlsm/internal/llm"
 	"semlsm/internal/vfs"
 )
 
@@ -79,6 +82,57 @@ func TestOptionsValidate(t *testing.T) {
 			t.Errorf("%s: expected error", tt.name)
 		}
 	}
+}
+
+// M-025 item 3: Open must reject a Summarizer whose token rate cannot cover
+// a worst-case request (MaxChunkBytes/3 + MaxOutputTokens), because such a
+// request could never be admitted by the limiter.
+func TestOptionsTokenRateCoversWorstCaseRequest(t *testing.T) {
+	newStack := func(tokensPerMinute int) *llm.Stack {
+		s, err := llm.NewSummarizer(llm.NewMock(llm.MockValid), llm.Config{
+			Model:             "m",
+			Dir:               t.TempDir(), // OS FS is fine for the stack's own files
+			MaxTokensTotal:    1 << 40,
+			RequestsPerMinute: 600,
+			TokensPerMinute:   tokensPerMinute,
+			CacheMaxBytes:     0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	// Default MaxChunkBytes (32 KiB): worst case = 32768/3 + 2048 = 12970.
+	tooSmall := newStack(100)
+	o := Options{FS: vfs.NewMemFS(), Summarizer: tooSmall}
+	_, err := o.withDefaults()
+	if err == nil || !strings.Contains(err.Error(), "TokensPerMinute") {
+		t.Fatalf("want TokensPerMinute rejection, got %v", err)
+	}
+
+	// A rate that covers the worst case passes validation.
+	bigEnough := newStack(20_000)
+	o = Options{FS: vfs.NewMemFS(), Summarizer: bigEnough}
+	if _, err := o.withDefaults(); err != nil {
+		t.Fatalf("sufficient rate rejected: %v", err)
+	}
+
+	// A non-Stack Summarizer without the capability is not checked.
+	o = Options{FS: vfs.NewMemFS(), Summarizer: plainSummarizer{}}
+	if _, err := o.withDefaults(); err != nil {
+		t.Fatalf("capability-less summarizer must not be checked: %v", err)
+	}
+}
+
+// plainSummarizer satisfies llm.Summarizer without exposing its rate, so the
+// Open-time capability check must simply skip it.
+type plainSummarizer struct{}
+
+func (plainSummarizer) Model() string      { return "plain" }
+func (plainSummarizer) PromptVersion() int { return 1 }
+func (plainSummarizer) Complete(ctx context.Context, r llm.Request) (llm.Response, error) {
+	return llm.Response{}, errors.New("not used")
 }
 
 func TestPolicyFor(t *testing.T) {

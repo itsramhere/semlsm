@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -25,8 +26,17 @@ type Config struct {
 
 	// Accept decides whether a response may enter the cache; only
 	// validated responses are stored (P9.4). nil stores everything.
-	Accept func(req Request, resp Response) error
+	Accept func(Request, Response) error
 	Clock  Clock // nil -> RealClock
+	Logger *slog.Logger
+}
+
+// rateLimiter is the limiter surface the stack needs; *Limiter implements it
+// and tests may stub it.
+type rateLimiter interface {
+	Wait(ctx context.Context, tokens int) error
+	Release()
+	TokensPerMinute() int
 }
 
 // Stack composes the reliability layers around a raw Client (P9.6):
@@ -43,9 +53,10 @@ type Stack struct {
 	cache   *Cache // nil if disabled
 	budget  *Budget
 	breaker *Breaker
-	limiter *Limiter
+	limiter rateLimiter
 	next    Client
 	accept  func(Request, Response) error
+	log     *slog.Logger
 
 	cacheHits atomic.Int64
 }
@@ -70,12 +81,17 @@ func NewSummarizer(next Client, cfg Config) (*Stack, error) {
 	if clk == nil {
 		clk = RealClock{}
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	s := &Stack{
 		model:         cfg.Model,
 		promptVersion: cfg.PromptVersion,
 		breaker:       NewBreaker(clk),
 		next:          next,
 		accept:        cfg.Accept,
+		log:           logger,
 	}
 	budget, err := OpenBudget(cfg.FS, cfg.Dir, cfg.MaxTokensTotal)
 	if err != nil {
@@ -111,6 +127,10 @@ func (s *Stack) BreakerState() (string, time.Duration) {
 	return s.breaker.State()
 }
 
+// TokensPerMinute exposes the token burst so Open can check that it covers a
+// worst-case request (Options validation, M-025 item 3).
+func (s *Stack) TokensPerMinute() int { return s.limiter.TokensPerMinute() }
+
 // Complete runs one logical call through the layers, outermost first.
 func (s *Stack) Complete(ctx context.Context, req Request) (Response, error) {
 	if s.cache != nil {
@@ -128,7 +148,10 @@ func (s *Stack) Complete(ctx context.Context, req Request) (Response, error) {
 		return Response{}, err
 	}
 	if err := s.limiter.Wait(ctx, int(estimate)); err != nil {
+		// The call never reached the upstream client, so the half-open
+		// trial (if any) must be given back (M-025 item 2).
 		s.budget.Release(estimate)
+		s.breaker.Cancel()
 		return Response{}, err
 	}
 	defer s.limiter.Release()
@@ -141,7 +164,11 @@ func (s *Stack) Complete(ctx context.Context, req Request) (Response, error) {
 	}
 	s.breaker.RecordSuccess()
 	if err := s.budget.Record(estimate, resp); err != nil {
-		return Response{}, err
+		// The tokens are already spent and the response is valid, so the
+		// caller keeps it (M-025 item 4): persisting usage is best-effort.
+		// The in-memory totals were applied before the write; only the
+		// on-disk file may lag until the next Record.
+		s.log.Warn("llm: persisting usage.json failed; in-memory budget continues", "err", err)
 	}
 	if s.cache != nil && (s.accept == nil || s.accept(req, resp) == nil) {
 		s.cache.Put(s.model, s.promptVersion, req, resp)
