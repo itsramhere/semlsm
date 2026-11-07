@@ -95,7 +95,14 @@ func (s *Snapshot) NewIterator(o IterOptions) *Iterator {
 		it := &Iterator{err: ErrReleased}
 		return it
 	}
-	return s.db.newIteratorAt(o, s.ts, s.rs, s)
+	// The iterator owns its own reference: take one on the snapshot's
+	// pinned version, because Iterator.Close releases exactly the readState
+	// it is given. Sharing s.rs directly would let every iterator Close
+	// consume one of the snapshot's references and eventually drive the
+	// version's refcount below zero (found by the P11.4 model test).
+	s.rs.version.Ref()
+	return s.db.newIteratorAt(o, s.ts,
+		&readState{mem: s.rs.mem, imms: s.rs.imms, version: s.rs.version}, s)
 }
 
 // Release unpins the snapshot. Idempotent.

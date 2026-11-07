@@ -293,9 +293,16 @@ func (db *DB) checkpointInfoFor(key []byte, entry resolve.Entry, hit *ckptHit) (
 	if hit == nil {
 		return nil, errors.New("semlsm: no covering checkpoint")
 	}
-	meta, err := hit.reader.ReadMeta(hit.ref.ID)
+	info, err := buildCheckpointInfo(hit.reader, hit.ref, entry)
+	hit.rel()
+	return info, err
+}
+
+// buildCheckpointInfo assembles the CheckpointInfo from one tuple's meta and
+// summary plus the key's entry. Shared by GetAt and the iterator (P11.1).
+func buildCheckpointInfo(r *checkpoint.Reader, ref manifest.TupleRef, entry resolve.Entry) (*CheckpointInfo, error) {
+	meta, err := r.ReadMeta(ref.ID)
 	if err != nil {
-		hit.rel()
 		return nil, err
 	}
 	info := &CheckpointInfo{
@@ -311,10 +318,9 @@ func (db *DB) checkpointInfoFor(key []byte, entry resolve.Entry, hit *ckptHit) (
 		KeyCount:         entry.Count,
 		ArchiveAvailable: meta.ArchiveFileNum != 0,
 	}
-	if sumJSON, err := hit.reader.ReadSummary(hit.ref.ID); err == nil && len(sumJSON) > 0 {
+	if sumJSON, err := r.ReadSummary(ref.ID); err == nil && len(sumJSON) > 0 {
 		_ = json.Unmarshal(sumJSON, &info.Summary)
 	}
-	hit.rel()
 	return info, nil
 }
 

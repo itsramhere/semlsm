@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"semlsm/internal/base"
+	"semlsm/internal/checkpoint"
 	"semlsm/internal/compaction"
 	"semlsm/internal/failpoint"
 	"semlsm/internal/manifest"
+	"semlsm/internal/memtable"
 	"semlsm/internal/merge"
 	"semlsm/internal/semantic"
 	"semlsm/internal/sstable"
@@ -438,13 +441,32 @@ type VerifyReport struct {
 	Problems  []string
 }
 
+// tupleRun is one key's dropped range within a tuple (I7 checking).
+type tupleRun struct {
+	min, max uint64
+	tuple    uint64
+}
+
 // VerifyIntegrity reads every block of every SST and every section of every
-// checkpoint referenced by the current version. Any CRC or structural
+// checkpoint referenced by the current version, walks I7 across all tuples
+// and raw versions, recomputes SourceCRC32 from archives where they exist,
+// and validates the PrevTupleID chains (P11.3). Any CRC or structural
 // failure is reported; it never returns wrong data silently (I12).
 func (db *DB) VerifyIntegrity(ctx context.Context) (VerifyReport, error) {
 	rep := VerifyReport{}
 	v := db.vs.Acquire()
 	defer v.Unref()
+
+	rawTs := map[string][]uint64{}
+	tupleRuns := map[string][]tupleRun{}
+	chains := map[string][]checkpoint.TupleMeta{}
+
+	recordRaw := func(ikey []byte) {
+		if u, ts, _, ok := base.SplitInternalKey(ikey); ok {
+			rawTs[string(u)] = append(rawTs[string(u)], ts)
+		}
+	}
+
 	for l := range v.Levels {
 		for _, f := range v.Levels[l] {
 			r, rel, err := db.tableCache.Get(f.Num)
@@ -455,6 +477,7 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (VerifyReport, error) {
 			it := r.NewIterator()
 			for it.First(); it.Valid(); it.Next() {
 				rep.Entries++
+				recordRaw(it.Key())
 			}
 			if e := it.Err(); e != nil {
 				rep.Problems = append(rep.Problems, fmt.Sprintf("sst %d: iterate: %v", f.Num, e))
@@ -464,6 +487,26 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (VerifyReport, error) {
 			rep.SSTFiles++
 		}
 	}
+	// Raw versions in the memtables are not dropped and must not sit inside
+	// any tuple range either.
+	if rs, _ := db.acquireReadState(); rs != nil {
+		addMem := func(mt *memtable.Memtable) {
+			if mt == nil {
+				return
+			}
+			it := mt.NewIterator()
+			for it.First(); it.Valid(); it.Next() {
+				recordRaw(it.Key())
+			}
+			it.Close()
+		}
+		addMem(rs.mem)
+		for _, im := range rs.imms {
+			addMem(im.mem)
+		}
+		releaseReadState(rs)
+	}
+
 	for num := range v.Ckpts.ByNum {
 		r, rel, err := db.ckptCache.Get(num)
 		if err != nil {
@@ -472,22 +515,130 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (VerifyReport, error) {
 		}
 		for _, t := range r.Tuples() {
 			rep.Tuples++
+			chains[t.Group] = append(chains[t.Group], t)
 			keys, err := r.IterKeys(t.ID)
 			if err != nil {
 				rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d tuple %d: index: %v", num, t.ID, err))
 				continue
 			}
-			for range keys {
+			for _, ke := range keys {
 				rep.Entries++
+				tupleRuns[string(ke.Key)] = append(tupleRuns[string(ke.Key)],
+					tupleRun{min: ke.MinTs, max: ke.MaxTs, tuple: t.ID})
 			}
 			if _, err := r.ReadSummary(t.ID); err != nil {
 				rep.Problems = append(rep.Problems, fmt.Sprintf("ckpt %d tuple %d: summary: %v", num, t.ID, err))
 			}
+			db.verifyArchiveCrc(&rep, t)
 		}
 		rel()
 		rep.CkptFiles++
 	}
+
+	// I7: dropped ranges per key are disjoint and contain no raw version.
+	for key, runs := range tupleRuns {
+		sort.Slice(runs, func(a, b int) bool { return runs[a].min < runs[b].min })
+		for i := 1; i < len(runs); i++ {
+			if runs[i-1].max >= runs[i].min {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("I7: key %q tuple ranges overlap: [%d,%d] and [%d,%d]",
+					key, runs[i-1].min, runs[i-1].max, runs[i].min, runs[i].max))
+			}
+		}
+		lo, hi := runs[0].min, runs[len(runs)-1].max
+		for _, ts := range rawTs[key] {
+			if ts >= lo && ts <= hi {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("I7: key %q raw version ts %d inside dropped range [%d,%d]",
+					key, ts, lo, hi))
+			}
+		}
+	}
+
+	// PrevTupleID chains: predecessors exist in the group, are used once,
+	// and following them terminates (no cycles).
+	for group, metas := range chains {
+		ids := map[uint64]bool{}
+		for _, t := range metas {
+			ids[t.ID] = true
+		}
+		prevOwner := map[uint64]uint64{}
+		for _, t := range metas {
+			if t.PrevTupleID == 0 {
+				continue
+			}
+			if !ids[t.PrevTupleID] {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("group %q tuple %d: PrevTupleID %d dangling", group, t.ID, t.PrevTupleID))
+				continue
+			}
+			if owner, dup := prevOwner[t.PrevTupleID]; dup && owner != t.ID {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("group %q: tuples %d and %d share PrevTupleID %d", group, owner, t.ID, t.PrevTupleID))
+			}
+			prevOwner[t.PrevTupleID] = t.ID
+		}
+		for _, t := range metas {
+			seen := map[uint64]bool{t.ID: true}
+			cur := t.PrevTupleID
+			for cur != 0 && !seen[cur] {
+				seen[cur] = true
+				var next uint64
+				for _, m := range metas {
+					if m.ID == cur {
+						next = m.PrevTupleID
+						break
+					}
+				}
+				cur = next
+			}
+			if cur != 0 {
+				rep.Problems = append(rep.Problems, fmt.Sprintf("group %q tuple %d: PrevTupleID chain has a cycle", group, t.ID))
+			}
+		}
+	}
 	return rep, nil
+}
+
+// verifyArchiveCrc recomputes one tuple's SourceCRC32 from its archive SST
+// (P11.3). A missing or mismatching archive is reported, never fatal.
+func (db *DB) verifyArchiveCrc(rep *VerifyReport, t checkpoint.TupleMeta) {
+	if t.ArchiveFileNum == 0 {
+		return
+	}
+	path := filepath.Join(db.dir, "archive", sstable.Name(t.ArchiveFileNum))
+	r, err := sstable.OpenReader(db.opts.FS, path)
+	if err != nil {
+		rep.Problems = append(rep.Problems, fmt.Sprintf("tuple %d: archive %d missing or unreadable: %v", t.ID, t.ArchiveFileNum, err))
+		return
+	}
+	defer r.Close()
+	var recs []base.Record
+	it := r.NewIterator()
+	for it.First(); it.Valid(); it.Next() {
+		u, ts, k, ok := base.SplitInternalKey(it.Key())
+		if !ok {
+			it.Close()
+			rep.Problems = append(rep.Problems, fmt.Sprintf("archive %d: bad internal key", t.ArchiveFileNum))
+			return
+		}
+		recs = append(recs, base.Record{Key: append([]byte(nil), u...), Ts: ts, Kind: k, Value: append([]byte(nil), it.Value()...)})
+	}
+	if e := it.Err(); e != nil {
+		it.Close()
+		rep.Problems = append(rep.Problems, fmt.Sprintf("archive %d: read: %v", t.ArchiveFileNum, e))
+		return
+	}
+	it.Close()
+	if uint64(len(recs)) != t.SourceCount {
+		rep.Problems = append(rep.Problems, fmt.Sprintf("tuple %d: archive %d holds %d records, want %d", t.ID, t.ArchiveFileNum, len(recs), t.SourceCount))
+		return
+	}
+	sort.Slice(recs, func(a, b int) bool {
+		if recs[a].Ts != recs[b].Ts {
+			return recs[a].Ts < recs[b].Ts
+		}
+		return string(recs[a].Key) < string(recs[b].Key)
+	})
+	if crc := base.SourceCRC(recs); crc != t.SourceCRC32 {
+		rep.Problems = append(rep.Problems, fmt.Sprintf("tuple %d: archive %d CRC %08x, want %08x", t.ID, t.ArchiveFileNum, crc, t.SourceCRC32))
+	}
 }
 
 // ----- Tier B: semantic compaction (P10) -----
