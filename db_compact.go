@@ -861,6 +861,9 @@ func (db *DB) runSemantic(plan *compaction.Plan, sweepNum uint64) error {
 	if err := db.appendManifestLocked(e, db.vs.CurrentLastTs()); err != nil {
 		db.manifestMu.Unlock()
 		unmark()
+		// The edit never became durable: the job's files would otherwise
+		// leak and grow the disk on every retry (M-027 item 1).
+		db.removeSemanticFiles(res)
 		db.foldJobStats(nil, compaction.SemanticStats{}, "failed")
 		return fmt.Errorf("semlsm: semantic manifest: %w", err)
 	}
@@ -887,6 +890,25 @@ func (db *DB) runSemantic(plan *compaction.Plan, sweepNum uint64) error {
 	// pinning this version keeps the inputs alive.
 	db.drainObsolete()
 	return nil
+}
+
+// removeSemanticFiles deletes the files a finished-but-uninstalled semantic
+// job wrote (outputs, checkpoint, archives). Only for errors before the
+// manifest edit is durable (M-027 item 1).
+func (db *DB) removeSemanticFiles(res *compaction.SemanticResult) {
+	if res == nil {
+		return
+	}
+	for _, fm := range res.Outputs {
+		_ = db.opts.FS.Remove(filepath.Join(db.dir, sstable.Name(fm.Num)))
+	}
+	if res.Ckpt.FileNum != 0 {
+		_ = db.opts.FS.Remove(filepath.Join(db.dir, ckptName(res.Ckpt.FileNum)))
+	}
+	for _, num := range res.Archives {
+		_ = db.opts.FS.Remove(filepath.Join(db.dir, "archive", sstable.Name(num)))
+	}
+	_ = db.opts.FS.SyncDir(db.dir)
 }
 
 // foldJobStats folds one finished job's accounting into the Stats counters

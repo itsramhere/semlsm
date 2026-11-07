@@ -863,3 +863,130 @@ func verifyI7All(t *testing.T, db *DB) {
 		}
 	}
 }
+
+// TestSemanticOverOlderRawGeneration ports the supervisor's I10 scenario
+// (M-027): older raw versions of a key live at L4 while a newer generation is
+// summarized at L3. A read inside the summarized range must not return the
+// stale L4 raw version; a read between the generations must be Exact.
+func TestSemanticOverOlderRawGeneration(t *testing.T) {
+	db, clk, _ := openSemDB(t, "db", llm.NewMock(llm.MockValid), nil)
+	defer db.Close()
+	key := []byte("agent/1/state")
+	ctx := context.Background()
+
+	var genA []uint64
+	for i := 0; i < 50; i++ {
+		ts, err := db.Put(key, []byte(fmt.Sprintf("A%03d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		genA = append(genA, ts)
+	}
+	// Generation A goes down raw (too young for MinAge).
+	driveDown(t, db)
+
+	clk.Set(semStart.Add(10 * time.Hour))
+	var genB []uint64
+	for i := 0; i < 200; i++ {
+		ts, err := db.Put(key, []byte(fmt.Sprintf("B%03d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		genB = append(genB, ts)
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	clk.Set(semStart.Add(20 * time.Hour))
+	for lvl := 0; lvl <= 2; lvl++ {
+		if err := db.CompactLevel(ctx, lvl); err != nil {
+			t.Fatalf("compact %d: %v", lvl, err)
+		}
+	}
+	if db.Stats().SemanticTuplesCreated == 0 {
+		t.Skip("no tuple created at L2->L3; scenario not reached")
+	}
+	mid := genB[100]
+	r, err := db.GetAt(key, mid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Kind == ResultExact && len(r.Value) > 0 && r.Value[0] == 'A' {
+		t.Fatalf("stale read: GetAt(mid of gen B) returned gen A raw %q (I10)", r.Value)
+	}
+	if r.Kind != ResultSummarized {
+		t.Fatalf("mid gen B: kind=%d val=%q, want Summarized", r.Kind, r.Value)
+	}
+	r, err = db.GetAt(key, genA[len(genA)-1])
+	if err != nil || r.Kind != ResultExact || string(r.Value) != "A049" {
+		t.Fatalf("between generations: kind=%d val=%q err=%v, want Exact A049", r.Kind, r.Value, err)
+	}
+	r, err = db.Get(key)
+	if err != nil || r.Kind != ResultExact || string(r.Value) != "B199" {
+		t.Fatalf("latest: kind=%d val=%q err=%v", r.Kind, r.Value, err)
+	}
+	// Second pass: push gen B onto L4 next to gen A and summarize again.
+	if err := db.CompactLevel(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompactLevel(ctx, 4); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []uint64{genA[10], genB[50], genB[150]} {
+		r, err := db.GetAt(key, s)
+		if err != nil {
+			t.Fatalf("GetAt %d after bottom pass: %v", s, err)
+		}
+		if r.Kind == ResultExact && s >= genB[0] && r.Value[0] == 'A' {
+			t.Fatalf("stale after bottom pass at %d: %q", s, r.Value)
+		}
+	}
+	verifyI7All(t, db)
+}
+
+// TestSemanticFailedJobCleansUpFiles ports the supervisor's leak test
+// (M-027 item 1): a job that fails after writing its outputs and checkpoint
+// must remove them again, or a persistent error grows the disk on retry.
+func TestSemanticFailedJobCleansUpFiles(t *testing.T) {
+	db, clk, _ := openSemDB(t, "db", llm.NewMock(llm.MockValid), nil)
+	defer db.Close()
+	key := []byte("agent/2/state")
+	for i := 0; i < 300; i++ {
+		if _, err := db.Put(key, []byte(fmt.Sprintf("v%03d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	for lvl := 0; lvl <= 1; lvl++ {
+		if err := db.CompactLevel(ctx, lvl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := listDBFiles(t, db)
+	clk.Set(semStart.Add(5 * time.Hour))
+	failpoint.SetError("semantic.after_ckpt", errors.New("injected"))
+	_ = db.CompactLevel(ctx, 2)
+	failpoint.Reset()
+	after := listDBFiles(t, db)
+	for name := range after {
+		if !before[name] {
+			t.Errorf("failed job left %s on disk", name)
+		}
+	}
+}
+
+func listDBFiles(t *testing.T, db *DB) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	ents, err := db.opts.FS.List(db.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		out[e.Name] = true
+	}
+	return out
+}

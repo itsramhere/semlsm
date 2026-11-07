@@ -648,6 +648,43 @@ func (db *DB) cleanupOrphans(replayedWals []uint64) error {
 			_ = db.opts.FS.Remove(path)
 		}
 	}
+
+	// Archive orphan sweep (M-027 item 2): archives are referenced only
+	// through TupleMeta.ArchiveFileNum, so one written between its file and
+	// the manifest edit would leak forever. Read every live checkpoint's
+	// tuple metas (one small section per tuple, bounded by Open time) and
+	// delete unreferenced archive files. Reading the checkpoints is the
+	// chosen approach over deferring to P13: correctness at every Open
+	// outweighs the extra metas.
+	keepArchive := map[uint64]bool{}
+	for num := range keepCkpt {
+		r, err := checkpoint.OpenReader(db.opts.FS, filepath.Join(db.dir, ckptName(num)))
+		if err != nil {
+			continue // unreadable ckpt: its archives are left for the deleter
+		}
+		for _, t := range r.Tuples() {
+			if t.ArchiveFileNum != 0 {
+				keepArchive[t.ArchiveFileNum] = true
+			}
+		}
+		r.Close()
+	}
+	archDir := filepath.Join(db.dir, "archive")
+	if ents, err := db.opts.FS.List(archDir); err == nil {
+		removed := false
+		for _, e := range ents {
+			if e.IsDir {
+				continue
+			}
+			if num, ok, suffix := parseFileNum(e.Name); ok && suffix == ".sst" && !keepArchive[num] {
+				_ = db.opts.FS.Remove(filepath.Join(archDir, e.Name))
+				removed = true
+			}
+		}
+		if removed {
+			_ = db.opts.FS.SyncDir(archDir)
+		}
+	}
 	return db.opts.FS.SyncDir(db.dir)
 }
 

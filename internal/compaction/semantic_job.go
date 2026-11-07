@@ -290,11 +290,37 @@ func RunSemantic(ctx context.Context, plan *Plan, d SemanticDeps) (*SemanticResu
 		fm.Level = plan.OutputLevel
 	}
 	res.Outputs = outputs
+
+	// From here on the job's files exist on disk while nothing is installed
+	// yet: any error must remove them, or a persistent failure (disk full,
+	// repeated timeout before commit) grows the disk on every retry
+	// (M-027 item 1).
+	cleanupOutputs := func() {
+		for _, fm := range res.Outputs {
+			_ = d.FS.Remove(filepath.Join(d.Dir, sstable.Name(fm.Num)))
+		}
+		if res.Ckpt.FileNum != 0 {
+			_ = d.FS.Remove(filepath.Join(d.Dir, fmt.Sprintf("%06d.ckpt", res.Ckpt.FileNum)))
+		}
+		for _, num := range res.Archives {
+			_ = d.FS.Remove(filepath.Join(d.ArchiveDir, sstable.Name(num)))
+		}
+		_ = d.FS.SyncDir(d.Dir)
+		if d.ArchiveRaw && len(res.Archives) > 0 {
+			_ = d.FS.SyncDir(d.ArchiveDir)
+		}
+		res.Outputs, res.Ckpt, res.Archives = nil, manifest.CkptFile{}, nil
+	}
+	fail := func(err error) (*SemanticResult, SemanticStats, error) {
+		cleanupOutputs()
+		return nil, stats, err
+	}
+
 	if err := d.FS.SyncDir(d.Dir); err != nil {
-		return nil, stats, fmt.Errorf("semantic: syncdir outputs: %w", err)
+		return fail(fmt.Errorf("semantic: syncdir outputs: %w", err))
 	}
 	if err := failpoint.Hit(FpSemanticAfterOutputs); err != nil {
-		return nil, stats, err
+		return fail(err)
 	}
 
 	// Step 8: one .ckpt holding every tuple of this job. Archive file
@@ -304,7 +330,7 @@ func RunSemantic(ctx context.Context, plan *Plan, d SemanticDeps) (*SemanticResu
 	if len(drafts) > 0 {
 		if d.ArchiveRaw {
 			if err := d.FS.MkdirAll(d.ArchiveDir); err != nil {
-				return nil, stats, fmt.Errorf("semantic: archive dir: %w", err)
+				return fail(fmt.Errorf("semantic: archive dir: %w", err))
 			}
 			for i := range drafts {
 				drafts[i].meta.ArchiveFileNum = d.AllocNum()
@@ -314,13 +340,13 @@ func RunSemantic(ctx context.Context, plan *Plan, d SemanticDeps) (*SemanticResu
 		ckptNum := d.AllocNum()
 		cw, err := checkpoint.NewWriter(d.FS, filepath.Join(d.Dir, fmt.Sprintf("%06d.ckpt", ckptNum)))
 		if err != nil {
-			return nil, stats, err
+			return fail(err)
 		}
 		for i := range drafts {
 			sumJSON, err := json.Marshal(drafts[i].summary)
 			if err != nil {
 				cw.Abort()
-				return nil, stats, fmt.Errorf("semantic: summary json: %w", err)
+				return fail(fmt.Errorf("semantic: summary json: %w", err))
 			}
 			stats.SummaryBytes += uint64(len(sumJSON))
 			if err := cw.AddTuple(drafts[i].meta, sumJSON, drafts[i].entries); err != nil {
@@ -330,7 +356,7 @@ func RunSemantic(ctx context.Context, plan *Plan, d SemanticDeps) (*SemanticResu
 		}
 		if err := cw.Finish(); err != nil {
 			cw.Abort()
-			return nil, stats, fmt.Errorf("semantic: ckpt finish: %w", err)
+			return fail(fmt.Errorf("semantic: ckpt finish: %w", err))
 		}
 		size := int64(0)
 		if st, err := d.FS.Stat(filepath.Join(d.Dir, fmt.Sprintf("%06d.ckpt", ckptNum))); err == nil {
@@ -348,10 +374,10 @@ func RunSemantic(ctx context.Context, plan *Plan, d SemanticDeps) (*SemanticResu
 			})
 		}
 		if err := d.FS.SyncDir(d.Dir); err != nil {
-			return nil, stats, fmt.Errorf("semantic: syncdir ckpt: %w", err)
+			return fail(fmt.Errorf("semantic: syncdir ckpt: %w", err))
 		}
 		if err := failpoint.Hit(FpSemanticAfterCkpt); err != nil {
-			return nil, stats, err
+			return fail(err)
 		}
 	}
 
@@ -360,14 +386,14 @@ func RunSemantic(ctx context.Context, plan *Plan, d SemanticDeps) (*SemanticResu
 	if d.ArchiveRaw && len(drafts) > 0 {
 		for i := range drafts {
 			if err := writeArchive(d, &drafts[i]); err != nil {
-				return nil, stats, err
+				return fail(err)
 			}
 		}
 		if err := d.FS.SyncDir(d.ArchiveDir); err != nil {
-			return nil, stats, fmt.Errorf("semantic: syncdir archive: %w", err)
+			return fail(fmt.Errorf("semantic: syncdir archive: %w", err))
 		}
 		if err := failpoint.Hit(FpSemanticAfterArchive); err != nil {
-			return nil, stats, err
+			return fail(err)
 		}
 	}
 
