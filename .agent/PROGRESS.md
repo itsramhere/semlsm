@@ -183,7 +183,7 @@ fix(P6) applied (M-015 items 3,2,4,5,6,8,9 + supervisor scenarios):
 - [x] Gate 6 (P6) — PASSED (re-run): fix(P6) fb81ad7, tag phase-6-done, verdict M-021; 97b3812 was the original pass
 - [x] Gate 7 (P7) — PASSED, commit 499daf4, tag phase-7-done
 - [x] Gate 8 (P8) — PASSED, commit d76b556 (fix(P8) race on Usage), tag phase-8-done, verdict M-022: approved on GATE EVIDENCE ONLY (no line-by-line review of internal/semantic). P8.2-P8.6 landed before the G-025 verdict (A10 continuation); disclosed in G-026. Run ended by M-023 STOP: P9-P15 not started.
-- [ ] Gate 9 (P9) — tag phase-9-done on 82b77ca; verdict M-025 CHANGES -> fix(P9) re-run gated, GATE G-032
+- [x] Gate 9 (P9) — PASSED: 82b77ca, fix(P9) 28a0659 (M-025 CHANGES: breaker trial wedge, Cancel, limiter fail-fast + Open-time TokensPerMinute check, persist-failure keeps response), tag phase-9-done re-pointed to 28a0659, verdict M-026 APPROVED
 - [ ] Gate 10 (P10) — tagged phase-10-done
 - [ ] Gate 11 (P11) — tagged phase-11-done
 - [ ] Gate 12 (P12) — tagged phase-12-done
