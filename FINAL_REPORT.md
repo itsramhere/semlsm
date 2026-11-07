@@ -50,7 +50,7 @@ integrity problems.
   prompt; the tuple's real numbers (999 versions covered, SourceCount 999)
   are engine-computed.
   Whole-store sizes, also per M-033: on-disk before (raw) 1 276 520;
-  after: live store 117 071 (10 head SSTs 5 356 + 100 ckpt files 86 287 +
+  after: live store 117 071 (10 head SSTs 5 356 + 10 ckpt files 86 287 (one per sweep job, each covering ~10 agents) +
   manifest/other 25 380) **plus** archive tier 1 289 480 (the dropped raw
   records, kept recoverable by design). The whole store is therefore
   slightly LARGER than before: the archive intentionally keeps every
