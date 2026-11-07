@@ -4,6 +4,7 @@
 package semlsm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 	"semlsm/internal/failpoint"
 	"semlsm/internal/manifest"
 	"semlsm/internal/memtable"
+	"semlsm/internal/semantic"
 	"semlsm/internal/sstable"
 	"semlsm/internal/version"
 	"semlsm/internal/vfs"
@@ -58,6 +60,21 @@ type Stats struct {
 	LevelFiles         [base.NumLevels]int
 	LevelBytes         [base.NumLevels]int64
 	CompactionErrors   uint64 // failed compaction attempts since Open (M-015 item 6)
+
+	// Tier B semantic accounting (P10.3).
+	SemanticTuplesCreated     uint64
+	SemanticRecordsSummarized uint64
+	SemanticRawBytesRemoved   uint64
+	SemanticSummaryBytes      uint64
+	SemanticCompressionRatio  float64 // raw bytes removed / summary bytes
+	LLMCalls                  uint64
+	LLMInputTokens            uint64
+	LLMOutputTokens           uint64
+	LLMCacheHits              uint64
+	LLMBreakerState           string
+	LLMFailures               map[string]uint64 // by class since Open
+	SemanticPreemptions       uint64
+	SemanticJobs              map[string]uint64 // by outcome since Open
 }
 
 // immEntry is one immutable memtable awaiting flush, with the WAL number
@@ -149,6 +166,34 @@ type DB struct {
 	compactWG           sync.WaitGroup
 	compactionsInFlight int
 	busy                map[uint64]bool // file numbers used by running compactions
+
+	// Tier B semantic state (P10.2). semJobs is guarded by mu; the counters
+	// are atomics folded into Stats.
+	semSum    *semantic.Summarizer
+	semModel  string
+	semPV     int
+	semJobs   map[*semJobHandle]struct{}
+	nextTry   map[uint64]time.Time // L4 file -> earliest retry (sweep backoff)
+	lastSweep atomic.Int64         // unix nano of the last sweep attempt
+
+	semTuples      atomic.Uint64
+	semRecs        atomic.Uint64
+	semRawBytes    atomic.Uint64
+	semSumBytes    atomic.Uint64
+	semCalls       atomic.Uint64
+	semInTokens    atomic.Uint64
+	semOutTokens   atomic.Uint64
+	semPreemptions atomic.Uint64
+
+	semStatsMu sync.Mutex
+	semFail    map[string]uint64 // LLM failures by class
+	semJobsOut map[string]uint64 // jobs by outcome
+}
+
+// semJobHandle tracks one running semantic job for the anti-stall rule (I11).
+type semJobHandle struct {
+	cancel context.CancelFunc
+	files  map[uint64]bool // input file numbers the job holds busy
 }
 
 // file name helpers (B8).
@@ -195,6 +240,10 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 	db.stallCond = sync.NewCond(&db.mu)
 	db.busy = map[uint64]bool{}
+	db.semJobs = map[*semJobHandle]struct{}{}
+	db.nextTry = map[uint64]time.Time{}
+	db.semFail = map[string]uint64{}
+	db.semJobsOut = map[string]uint64{}
 	if err := db.openRecover(); err != nil {
 		lockH.Unlock()
 		return nil, err
@@ -645,6 +694,17 @@ func (db *DB) Close() error {
 		}
 		db.flushWG.Wait()
 
+		// wait for the compaction workers (flush and semantic jobs): they
+		// exit on closeCh; a job mid-install must finish before the caches
+		// and the manifest are torn down. Semantic jobs blocked in an LLM
+		// call are cancelled first, or Close would wait out the job timeout.
+		db.mu.Lock()
+		for h := range db.semJobs {
+			h.cancel()
+		}
+		db.mu.Unlock()
+		db.compactWG.Wait()
+
 		// sync + close WAL
 		if db.wal != nil {
 			if err := db.wal.Sync(); err != nil {
@@ -701,6 +761,40 @@ func (db *DB) Stats() Stats {
 	s.StallTime = time.Duration(db.stallNanos.Load())
 	s.SnapshotsOpen = int(db.snapshotsOpen.Load())
 	s.CompactionErrors = db.compactErrs.Load()
+
+	// Tier B accounting (P10.3). LLM health comes from the stack's live
+	// state; the capability check keeps non-stack Summarizers working.
+	s.SemanticTuplesCreated = db.semTuples.Load()
+	s.SemanticRecordsSummarized = db.semRecs.Load()
+	s.SemanticRawBytesRemoved = db.semRawBytes.Load()
+	s.SemanticSummaryBytes = db.semSumBytes.Load()
+	if s.SemanticSummaryBytes > 0 {
+		s.SemanticCompressionRatio = float64(s.SemanticRawBytesRemoved) / float64(s.SemanticSummaryBytes)
+	}
+	s.LLMCalls = db.semCalls.Load()
+	s.LLMInputTokens = db.semInTokens.Load()
+	s.LLMOutputTokens = db.semOutTokens.Load()
+	s.SemanticPreemptions = db.semPreemptions.Load()
+	db.semStatsMu.Lock()
+	s.LLMFailures = make(map[string]uint64, len(db.semFail))
+	for k, v := range db.semFail {
+		s.LLMFailures[k] = v
+	}
+	s.SemanticJobs = make(map[string]uint64, len(db.semJobsOut))
+	for k, v := range db.semJobsOut {
+		s.SemanticJobs[k] = v
+	}
+	db.semStatsMu.Unlock()
+	// LLM health and cache hits come from the stack's live state via
+	// capability checks, so non-stack Summarizers keep working.
+	if h, ok := db.opts.Summarizer.(interface{ CacheHits() int64 }); ok {
+		s.LLMCacheHits = uint64(h.CacheHits())
+	}
+	if h, ok := db.opts.Summarizer.(interface {
+		BreakerState() (string, time.Duration)
+	}); ok {
+		s.LLMBreakerState, _ = h.BreakerState()
+	}
 	return s
 }
 

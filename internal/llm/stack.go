@@ -131,6 +131,16 @@ func (s *Stack) BreakerState() (string, time.Duration) {
 // worst-case request (Options validation, M-025 item 3).
 func (s *Stack) TokensPerMinute() int { return s.limiter.TokensPerMinute() }
 
+// LLMHealthy reports whether the stack would currently admit a call: the
+// breaker is not open and the budget still has room (P10.2: while unhealthy,
+// Tier B runs raw structural compaction instead of LLM work).
+func (s *Stack) LLMHealthy() bool {
+	if state, _ := s.breaker.State(); state == "open" {
+		return false
+	}
+	return s.budget.Remaining() > 0
+}
+
 // Complete runs one logical call through the layers, outermost first.
 func (s *Stack) Complete(ctx context.Context, req Request) (Response, error) {
 	if s.cache != nil {

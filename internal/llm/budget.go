@@ -110,6 +110,18 @@ func (b *Budget) Used() (input, output, calls int64) {
 	return b.used.InputTokens, b.used.OutputTokens, b.used.Calls
 }
 
+// Remaining returns how many tokens the budget can still admit, counting
+// pending reservations (P10.2 health checks).
+func (b *Budget) Remaining() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r := b.max - b.used.InputTokens - b.used.OutputTokens - b.pending
+	if r < 0 {
+		r = 0
+	}
+	return r
+}
+
 func (b *Budget) returnPending(estimate int64) {
 	b.pending -= estimate
 	if b.pending < 0 {

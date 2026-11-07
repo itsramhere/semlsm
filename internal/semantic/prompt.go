@@ -153,3 +153,45 @@ func renderValue(value []byte, max int) string {
 	}
 	return neutralize(strings.ReplaceAll(s, "\n", "\\n"))
 }
+
+// PromptRecordIDs extracts the record ids a response to this user prompt may
+// cite: map prompts carry `r<i> |` record lines, reduce prompts embed partial
+// summaries whose `refs` arrays are the valid ids. It drives the response
+// cache's acceptance hook (P9.4: only validated responses are stored).
+func PromptRecordIDs(user string) map[string]bool {
+	ids := map[string]bool{}
+	for _, line := range strings.Split(user, "\n") {
+		// record line: "r17 | ts=+1234567 | PUT | key=... | value"
+		if len(line) > 2 && line[0] == 'r' {
+			i := 1
+			for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+				i++
+			}
+			if i > 1 && strings.HasPrefix(line[i:], " |") {
+				ids[line[:i]] = true
+				continue
+			}
+		}
+		// reduce prompt: embedded JSON with "refs":["r3","r9"]
+		for pos := 0; ; {
+			j := strings.Index(line[pos:], `"refs":`)
+			if j < 0 {
+				break
+			}
+			pos += j + len(`"refs":`)
+			open := strings.Index(line[pos:], "[")
+			close := strings.Index(line[pos:], "]")
+			if open < 0 || close < open {
+				break
+			}
+			for _, tok := range strings.Split(line[pos+open+1:pos+close], ",") {
+				tok = strings.Trim(strings.TrimSpace(tok), `"`)
+				if len(tok) > 1 && tok[0] == 'r' {
+					ids[tok] = true
+				}
+			}
+			pos += close + 1
+		}
+	}
+	return ids
+}
